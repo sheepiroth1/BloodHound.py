@@ -50,6 +50,33 @@ class MembershipEnumerator(object):
         self.aclenumerator = AclEnumerator(addomain, addc, collect)
         self.aceresolver = AceResolver(addomain, addomain.objectresolver)
         self.result_q = None
+        # Set when the user interrupts a run. Enumeration loops stop consuming
+        # their generator but still run their finalize block, so the JSON output
+        # files get their closing trailer instead of being left truncated.
+        self.interrupted = False
+
+    def interruptible(self, entries):
+        """
+        Consume an LDAP result generator, turning Ctrl-C into a clean stop.
+        The throttle sleeps happen inside the generator (one wait per LDAP page),
+        so KeyboardInterrupt surfaces here rather than in the loop body. Letting
+        the for-loop end normally means the caller still reaches the
+        result_q.put(None) / result_q.join() block that closes the output file.
+        """
+        try:
+            for entry in entries:
+                if self.interrupted:
+                    # Another generator in this phase was interrupted, so stop
+                    # consuming instead of issuing more throttled queries
+                    return
+                yield entry
+        except KeyboardInterrupt:
+            self.interrupted = True
+            logging.warning('Interrupted - closing the current output file, then stopping')
+
+    def raise_if_interrupted(self):
+        if self.interrupted:
+            raise KeyboardInterrupt
 
     def get_membership(self, member):
         """
@@ -128,7 +155,7 @@ class MembershipEnumerator(object):
         # Should we include extra properties in the query?
         with_properties = 'objectprops' in self.collect
         acl = 'acl' in self.collect
-        entries = self.addc.get_users(include_properties=with_properties, acl=acl)
+        entries = self.interruptible(self.addc.get_users(include_properties=with_properties, acl=acl))
 
         logging.debug('Writing users to file: %s', filename)
 
@@ -238,6 +265,7 @@ class MembershipEnumerator(object):
         else:
             self.result_q.put(None)
         self.result_q.join()
+        self.raise_if_interrupted()
 
         logging.debug('Finished writing users')
 
@@ -259,7 +287,7 @@ class MembershipEnumerator(object):
             filename = fileNamePrefix + "_" + timestamp + 'groups.json'
         else:
             filename = timestamp + 'groups.json'
-        entries = self.addc.get_groups(include_properties=with_properties, acl=acl)
+        entries = self.interruptible(self.addc.get_groups(include_properties=with_properties, acl=acl))
 
         logging.debug('Writing groups to file: %s', filename)
 
@@ -343,6 +371,7 @@ class MembershipEnumerator(object):
         else:
             self.result_q.put(None)
         self.result_q.join()
+        self.raise_if_interrupted()
 
         logging.debug('Finished writing groups')
 
@@ -359,7 +388,7 @@ class MembershipEnumerator(object):
         with_properties = 'objectprops' in self.collect
         acl = 'acl' in self.collect
 
-        entries = self.addc.get_computers(include_properties=with_properties, acl=acl)
+        entries = self.interruptible(self.addc.get_computers(include_properties=with_properties, acl=acl))
 
         logging.debug('Writing computers ACL to file: %s', filename)
 
@@ -410,6 +439,7 @@ class MembershipEnumerator(object):
         else:
             self.result_q.put(None)
         self.result_q.join()
+        self.raise_if_interrupted()
 
         logging.debug('Finished writing computers')
 
@@ -421,7 +451,7 @@ class MembershipEnumerator(object):
 
         with_properties = 'objectprops' in self.collect
         acl = 'acl' in self.collect
-        entries = self.addc.get_gpos(include_properties=with_properties, acl=acl)
+        entries = self.interruptible(self.addc.get_gpos(include_properties=with_properties, acl=acl))
 
         logging.debug('Writing GPOs to file: %s', filename)
 
@@ -497,6 +527,7 @@ class MembershipEnumerator(object):
         else:
             self.result_q.put(None)
         self.result_q.join()
+        self.raise_if_interrupted()
 
         logging.debug('Finished writing GPO')
 
@@ -507,7 +538,7 @@ class MembershipEnumerator(object):
             filename = timestamp + 'ous.json'
         with_properties = 'objectprops' in self.collect
         acl = 'acl' in self.collect
-        entries = self.addc.get_ous(include_properties=with_properties, acl=acl)
+        entries = self.interruptible(self.addc.get_ous(include_properties=with_properties, acl=acl))
 
         logging.debug('Writing OU to file: %s', filename)
 
@@ -562,16 +593,37 @@ class MembershipEnumerator(object):
                 else:
                     ou['Properties']['whencreated'] = calendar.timegm(whencreated.timetuple())
             
-            for childentry in self.addc.get_childobjects(ou["Properties"]["distinguishedname"]):
-                resolved_childentry = ADUtils.resolve_ad_entry(childentry)
-                # Skip children with empty ID because it breaks ingestion
-                if not resolved_childentry['objectid']:
+            oudn = ou["Properties"]["distinguishedname"]
+            enumstate = self.addomain.enumstate
+            if enumstate is not None and enumstate.is_done(oudn):
+                # Already enumerated in an earlier (throttled) run - reuse it
+                ou["ChildObjects"] = enumstate.children(oudn)
+                logging.debug('Resuming: reusing %d cached child objects for %s', len(ou["ChildObjects"]), oudn)
+            else:
+                childrecords = []
+                for childentry in self.interruptible(self.addc.get_childobjects(oudn)):
+                    resolved_childentry = ADUtils.resolve_ad_entry(childentry)
+                    # Skip children with empty ID because it breaks ingestion
+                    if not resolved_childentry['objectid']:
+                        continue
+                    out_object = {
+                        "ObjectIdentifier":resolved_childentry['objectid'],
+                        "ObjectType":resolved_childentry['type']
+                    }
+                    ou["ChildObjects"].append(out_object)
+                    childrecord = dict(out_object)
+                    childrecord["dn"] = ADUtils.get_entry_property(childentry, 'distinguishedName', '').upper()
+                    childrecords.append(childrecord)
+                if self.interrupted:
+                    # Only part of this OU's children came back - writing it would
+                    # emit a truncated record and marking it done would hide that
+                    # on a resumed run, so drop it and let the resume redo this one
                     continue
-                out_object = {
-                    "ObjectIdentifier":resolved_childentry['objectid'],
-                    "ObjectType":resolved_childentry['type']
-                }
-                ou["ChildObjects"].append(out_object)
+                if enumstate is not None:
+                    # Checkpoint per parent, so an interrupted run resumes from here
+                    # instead of re-querying the children of every OU
+                    enumstate.mark_done(oudn, 'ou', childrecords)
+                    enumstate.save()
             
             for gplink_dn, option in ADUtils.parse_gplink_string(ADUtils.get_entry_property(entry, 'gPLink', '')):
                 if option == 0 or option == 2:
@@ -617,6 +669,7 @@ class MembershipEnumerator(object):
         else:
             self.result_q.put(None)
         self.result_q.join()
+        self.raise_if_interrupted()
 
         logging.debug('Finished writing OU')
 
@@ -627,7 +680,7 @@ class MembershipEnumerator(object):
             filename = timestamp + 'containers.json'
         with_properties = 'objectprops' in self.collect
         acl = 'acl' in self.collect
-        entries = self.addc.get_containers(include_properties=with_properties, acl=acl)
+        entries = self.interruptible(self.addc.get_containers(include_properties=with_properties, acl=acl))
 
         logging.debug('Writing containers to file: %s', filename)
 
@@ -671,18 +724,37 @@ class MembershipEnumerator(object):
                 whencreated = ADUtils.get_entry_property(entry, 'whencreated', default=0)
                 container["Properties"]["whencreated"] =  calendar.timegm(whencreated.timetuple())
             
-            for childentry in self.addc.get_childobjects(container["Properties"]["distinguishedname"]):
-                if ADUtils.is_filtered_container_child(ADUtils.get_entry_property(childentry, 'distinguishedName')):
+            containerdn = container["Properties"]["distinguishedname"]
+            enumstate = self.addomain.enumstate
+            if enumstate is not None and enumstate.is_done(containerdn):
+                # Already enumerated in an earlier (throttled) run - reuse it
+                container["ChildObjects"] = enumstate.children(containerdn)
+                logging.debug('Resuming: reusing %d cached child objects for %s', len(container["ChildObjects"]), containerdn)
+            else:
+                childrecords = []
+                for childentry in self.interruptible(self.addc.get_childobjects(containerdn)):
+                    if ADUtils.is_filtered_container_child(ADUtils.get_entry_property(childentry, 'distinguishedName')):
+                        continue
+                    resolved_childentry = ADUtils.resolve_ad_entry(childentry)
+                    # Skip children with empty ID because it breaks ingestion
+                    if not resolved_childentry['objectid']:
+                        continue
+                    childobject = {
+                        "ObjectIdentifier":resolved_childentry['objectid'],
+                        "ObjectType":resolved_childentry['type']
+                    }
+                    container["ChildObjects"].append(childobject)
+                    childrecord = dict(childobject)
+                    childrecord["dn"] = ADUtils.get_entry_property(childentry, 'distinguishedName', '').upper()
+                    childrecords.append(childrecord)
+                if self.interrupted:
+                    # Partial children - drop the record so the resume re-queries it
                     continue
-                resolved_childentry = ADUtils.resolve_ad_entry(childentry)
-                # Skip children with empty ID because it breaks ingestion
-                if not resolved_childentry['objectid']:
-                    continue
-                childobject = {
-                    "ObjectIdentifier":resolved_childentry['objectid'],
-                    "ObjectType":resolved_childentry['type']
-                }
-                container["ChildObjects"].append(childobject)
+                if enumstate is not None:
+                    # Filtered children are excluded above, so they never reach the
+                    # state file and are not resurrected on a resumed run
+                    enumstate.mark_done(containerdn, 'container', childrecords)
+                    enumstate.save()
             
             # Create cache entry for links
             link_output = {
@@ -714,6 +786,7 @@ class MembershipEnumerator(object):
         else:
             self.result_q.put(None)
         self.result_q.join()
+        self.raise_if_interrupted()
 
         logging.debug('Finished writing containers')
 

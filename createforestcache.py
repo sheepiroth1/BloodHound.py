@@ -26,6 +26,7 @@ import os, sys, logging, argparse, getpass, time, re, datetime, codecs, json
 from zipfile import ZipFile
 from bloodhound.ad.domain import AD, ADDC
 from bloodhound.ad.authentication import ADAuthentication
+from bloodhound.ad import throttle as ldapthrottle
 from bloodhound.enumeration.computers import ComputerEnumerator
 from bloodhound.enumeration.memberships import MembershipEnumerator
 from bloodhound.enumeration.domains import DomainEnumerator
@@ -135,10 +136,34 @@ def main():
     parser.add_argument('--cachefile',
                         action='store',
                         help='Cache file name')
+    parser.add_argument('--ldap-delay',
+                        action='store',
+                        type=float,
+                        metavar='MINUTES',
+                        default=0.0,
+                        help='Wait this many minutes between LDAP queries (default: 0, no throttling). '
+                             'Counted per LDAP page, not per query')
+    parser.add_argument('--ldap-jitter',
+                        action='store',
+                        type=float,
+                        metavar='MINUTES',
+                        default=0.0,
+                        help='Random extra delay of 0 to this many minutes added to every --ldap-delay')
+    parser.add_argument('--ldap-page-size',
+                        action='store',
+                        type=int,
+                        metavar='ENTRIES',
+                        default=200,
+                        help='Entries per LDAP page (default: 200)')
     args = parser.parse_args()
 
     if args.v is True:
         logger.setLevel(logging.DEBUG)
+
+    ldapthrottle.set_page_size(args.ldap_page_size)
+    if ldapthrottle.set_throttler(args.ldap_delay * 60, args.ldap_jitter * 60):
+        logging.info('Throttling LDAP to one query per %g minute(s) plus up to %g minute(s) jitter',
+                     args.ldap_delay, args.ldap_jitter)
 
     if args.username is not None and args.password is not None:
         logging.debug('Authentication: username/password')

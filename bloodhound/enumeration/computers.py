@@ -55,6 +55,9 @@ class ComputerEnumerator(MembershipEnumerator):
         # Store collection methods specified
         self.collect = collect
         self.exclude_dcs = exclude_dcs
+        # This class does not chain to MembershipEnumerator.__init__, so the
+        # interrupt flag used by raise_if_interrupted() has to be set here too
+        self.interrupted = False
         if computerfile:
             logging.info('Limiting enumeration to FQDNs in %s', computerfile)
             with codecs.open(computerfile, 'r', 'utf-8') as cfile:
@@ -105,9 +108,27 @@ class ComputerEnumerator(MembershipEnumerator):
                 continue
 
             process_queue.put((hostname, samname, computer))
-        process_queue.join()
+        try:
+            process_queue.join()
+        except KeyboardInterrupt:
+            self.interrupted = True
+            logging.warning('Interrupted - stopping computer enumeration')
+            # Drop work that has not been picked up yet, then release one stop
+            # signal per worker. Without this the workers stay alive as daemon
+            # threads, the writer never gets its sentinel, and computers.json is
+            # left without its closing trailer (invalid JSON).
+            while True:
+                try:
+                    process_queue.get_nowait()
+                    process_queue.task_done()
+                except queue.Empty:
+                    break
+            for _ in range(0, num_workers):
+                process_queue.put(None)
+            process_queue.join()
         result_q.put(None)
         result_q.join()
+        self.raise_if_interrupted()
 
     def process_computer(self, hostname, samname, objectsid, entry, results_q):
         """
@@ -283,7 +304,13 @@ class ComputerEnumerator(MembershipEnumerator):
         logging.debug('Start working')
 
         while True:
-            hostname, samname, entry = process_queue.get()
+            item = process_queue.get()
+            if item is None:
+                # Stop signal from enumerate_computers after an interrupt - the
+                # worker exits so the result queue can be closed cleanly
+                process_queue.task_done()
+                break
+            hostname, samname, entry = item
             objectsid = entry['attributes']['objectSid']
             logging.info('Querying computer: %s', hostname)
             self.process_computer(hostname, samname, objectsid, entry, results_q)
