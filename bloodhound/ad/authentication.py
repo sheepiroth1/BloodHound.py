@@ -28,6 +28,7 @@ import os
 import traceback
 from hashlib import sha256, md5
 from bloodhound.ad.utils import CollectionException
+from bloodhound.ad.throttle import ThrottledConnection
 from binascii import unhexlify
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend

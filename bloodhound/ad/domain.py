@@ -34,8 +34,8 @@ from ldap3 import ALL_ATTRIBUTES, BASE, SUBTREE, LEVEL
 from ldap3.core.exceptions import LDAPKeyError, LDAPAttributeError, LDAPCursorError, LDAPNoSuchObjectResult, LDAPSocketReceiveError, LDAPSocketSendError, LDAPCommunicationError
 from ldap3.protocol.microsoft import security_descriptor_control
 from bloodhound.ad.utils import ADUtils, DNSCache, SidCache, SamCache, CollectionException
-from bloodhound.ad.throttle import get_page_size
 from bloodhound.ad.computer import ADComputer
+from bloodhound.ad.throttle import get_page_size
 from bloodhound.enumeration.objectresolver import ObjectResolver
 
 """
@@ -171,7 +171,7 @@ class ADDC(ADComputer):
         if self.resolverldap is None and use_resolver:
             self.ldap_connect(resolver=use_resolver)
         if search_base is None:
-            search_base = self.ad.baseDN
+            search_base = self.ad.search_baseDN or self.ad.baseDN
         if attributes is None or attributes == []:
             attributes = ALL_ATTRIBUTES
         if query_sd:
@@ -194,6 +194,7 @@ class ADDC(ADComputer):
             else:
                 searcher = self.ldap
 
+        logging.debug('LDAP query: base=%s filter=%s scope=%s', search_base, search_filter, search_scope)
         hadresults = False
         sresult = searcher.extend.standard.paged_search(search_base,
                                                         search_filter,
@@ -249,6 +250,7 @@ class ADDC(ADComputer):
                 searcher = self.ldap
         if attributes is None or attributes == []:
             attributes = ALL_ATTRIBUTES
+        logging.debug('LDAP single lookup: dn=%s', qobject)
         try:
             sresult = searcher.extend.standard.paged_search(qobject,
                                                             '(objectClass=*)',
@@ -303,11 +305,16 @@ class ADDC(ADComputer):
         if self.ldap is None:
             self.ldap_connect()
 
-        sresult = self.ldap.extend.standard.paged_search(self.ldap.server.info.other['schemaNamingContext'][0],
+        schema_base = self.ldap.server.info.other['schemaNamingContext'][0]
+        logging.debug('LDAP query: base=%s filter=(objectClass=*) [schema objecttype]', schema_base)
+        sresult = self.ldap.extend.standard.paged_search(schema_base,
                                                          '(objectClass=*)',
                                                          attributes=['name', 'schemaidguid'],
-                                                         paged_size=get_page_size())
+                                                         paged_size=get_page_size(),
+                                                         generator=True)
         for res in sresult:
+            if res['type'] != 'searchResEntry':
+                continue
             if res['attributes']['schemaIDGUID']:
                 guid = str(UUID(bytes_le=res['attributes']['schemaIDGUID']))
                 self.objecttype_guid_map[res['attributes']['name'].lower()] = guid
@@ -472,6 +479,28 @@ class ADDC(ADComputer):
                               query_sd=acl,
                               search_base=dn)
         return entries
+
+    def get_objects_in_location(self, dn, include_properties=False, acl=False):
+        properties = [
+            'distinguishedName', 'sAMAccountName', 'sAMAccountType',
+            'objectSid', 'objectClass', 'objectGUID', 'objectCategory',
+            'primaryGroupID', 'isDeleted', 'member',
+            'msDS-GroupMSAMembership',
+        ]
+        if include_properties:
+            properties += [
+                'servicePrincipalName', 'userAccountControl', 'displayName',
+                'lastLogon', 'lastLogonTimestamp', 'pwdLastSet', 'mail', 'title',
+                'homeDirectory', 'description', 'userPassword', 'adminCount',
+                'msDS-AllowedToDelegateTo', 'sIDHistory', 'whencreated', 'unicodepwd',
+                'scriptpath', 'operatingSystem', 'operatingSystemServicePack',
+                'operatingSystemVersion', 'dnshostname',
+            ]
+        if acl:
+            properties.append('nTSecurityDescriptor')
+        search_filter = '(|(objectClass=group)(sAMAccountType=805306369)(&(objectCategory=person)(objectClass=user)))'
+        return self.search(search_filter, properties, search_base=dn,
+                           search_scope=LEVEL, generator=True, query_sd=acl)
 
     def get_users(self, include_properties=False, acl=False):
 
@@ -681,8 +710,6 @@ class AD(object):
         self.computersidcache = SidCache()
         # Object Resolver, initialized later
         self.objectresolver = None
-        # EnumerationState for resumable runs, set by main(). None = no resume.
-        self.enumstate = None
         # Number of domains within the forest
         self.num_domains = 1
         # Does the schema have laps properties
@@ -695,6 +722,7 @@ class AD(object):
             self.baseDN = ADUtils.domain2ldap(domain)
         else:
             self.baseDN = None
+        self.search_baseDN = None
         if use_ldaps:
             self.ldap_default_protocol = 'ldaps'
         else:
@@ -729,27 +757,20 @@ class AD(object):
             cachedata = json.load(cfile)
         self.dncache = cachedata['dncache']
         self.newsidcache.load(cachedata['sidcache'])
-        logging.info('Loaded cached DNs and SIDs from cachefile')
+        logging.info('Loaded cached DNs and SIDs from %s', cachefile)
 
     def save_cachefile(self, cachefile):
-        """
-        Write the DN and SID caches out in the same shape load_cachefile() reads.
-        Both hot resolution paths are cache-first (AceResolver checks newsidcache
-        before querying, get_dn_from_cache_or_ldap checks dncache), so persisting
-        these turns most resolver lookups on a resumed run into zero-query hits.
-        """
-        sidcache = self.newsidcache.as_dict()
+        import os
         caches = {
             'dncache': self.dncache,
-            'sidcache': sidcache,
+            'sidcache': self.newsidcache.as_dict(),
         }
-        try:
-            with codecs.open(cachefile, 'w', 'utf-8') as outfile:
-                json.dump(caches, outfile)
-            logging.info('Saved %u DN and %u SID cache entries to %s',
-                         len(self.dncache), len(sidcache), cachefile)
-        except (OSError, TypeError) as e:
-            logging.warning('Could not write cache file %s: %s', cachefile, e)
+        tmpfile = cachefile + '.tmp'
+        with codecs.open(tmpfile, 'w', 'utf-8') as outfile:
+            json.dump(caches, outfile)
+        os.replace(tmpfile, cachefile)
+        logging.info('Saved resolver cache to %s (%d DN entries, %d SID entries)',
+                     cachefile, len(self.dncache), len(caches['sidcache']))
 
     def dns_resolve(self, domain=None, options=None):
         logging.debug('Querying domain controller information from DNS')

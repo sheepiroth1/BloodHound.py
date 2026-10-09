@@ -29,6 +29,7 @@ import calendar
 from bloodhound.ad.utils import ADUtils, AceResolver
 from bloodhound.ad.computer import ADComputer
 from bloodhound.ad.structures import LDAP_SID
+from bloodhound.ad.state import EnumerationState
 from bloodhound.enumeration.acls import AclEnumerator, parse_binary_acl
 from bloodhound.enumeration.outputworker import OutputWorker
 
@@ -38,7 +39,7 @@ class MembershipEnumerator(object):
     Contains the dumping functions which
     methods from the bloodhound.ad module.
     """
-    def __init__(self, addomain, addc, collect, disable_pooling):
+    def __init__(self, addomain, addc, collect, disable_pooling, state=None):
         """
         Membership enumeration. Enumerates all groups/users/other memberships.
         """
@@ -50,33 +51,24 @@ class MembershipEnumerator(object):
         self.aclenumerator = AclEnumerator(addomain, addc, collect)
         self.aceresolver = AceResolver(addomain, addomain.objectresolver)
         self.result_q = None
-        # Set when the user interrupts a run. Enumeration loops stop consuming
-        # their generator but still run their finalize block, so the JSON output
-        # files get their closing trailer instead of being left truncated.
+        self.state = state or EnumerationState(None)
         self.interrupted = False
 
     def interruptible(self, entries):
-        """
-        Consume an LDAP result generator, turning Ctrl-C into a clean stop.
-        The throttle sleeps happen inside the generator (one wait per LDAP page),
-        so KeyboardInterrupt surfaces here rather than in the loop body. Letting
-        the for-loop end normally means the caller still reaches the
-        result_q.put(None) / result_q.join() block that closes the output file.
-        """
+        if self.interrupted:
+            return
         try:
             for entry in entries:
-                if self.interrupted:
-                    # Another generator in this phase was interrupted, so stop
-                    # consuming instead of issuing more throttled queries
-                    return
                 yield entry
+                if self.interrupted:
+                    return
         except KeyboardInterrupt:
+            logging.warning('Interrupted during LDAP enumeration, finalizing current output...')
             self.interrupted = True
-            logging.warning('Interrupted - closing the current output file, then stopping')
 
     def raise_if_interrupted(self):
         if self.interrupted:
-            raise KeyboardInterrupt
+            raise KeyboardInterrupt()
 
     def get_membership(self, member):
         """
@@ -146,16 +138,256 @@ class MembershipEnumerator(object):
         # props['sfupassword'] = ADUtils.ensure_string(ADUtils.get_entry_property(entry, 'msSFU30Password'))
         props['sfupassword'] = None
 
+    def enumerate_per_location(self, timestamp="", fileNamePrefix=""):
+        if self.state.is_phase_complete('per_location'):
+            logging.info('Skipping per-location enumeration (already complete in state file)')
+            return
+
+        if not self.state.locations:
+            logging.info('Discovering OUs and containers for per-location enumeration...')
+            locations = []
+            search_root = self.addomain.search_baseDN or self.addomain.baseDN
+            locations.append(search_root)
+            for ou in self.addc.get_ous():
+                dn = ADUtils.get_entry_property(ou, 'distinguishedName')
+                if dn:
+                    locations.append(dn)
+            for container in self.addc.get_containers():
+                dn = ADUtils.get_entry_property(container, 'distinguishedName')
+                if dn and not ADUtils.is_filtered_container(dn):
+                    locations.append(dn)
+            self.state.set_locations(locations)
+
+        with_properties = 'objectprops' in self.collect
+        acl = 'acl' in self.collect
+
+        users_file = (fileNamePrefix + "_" + timestamp if fileNamePrefix else timestamp) + 'users.json'
+        groups_file = (fileNamePrefix + "_" + timestamp if fileNamePrefix else timestamp) + 'groups.json'
+        computers_file = (fileNamePrefix + "_" + timestamp if fileNamePrefix else timestamp) + 'computers.json'
+
+        user_q = queue.Queue()
+        group_q = queue.Queue()
+        computer_q = queue.Queue()
+        user_worker = threading.Thread(target=OutputWorker.membership_write_worker, args=(user_q, 'users', users_file))
+        group_worker = threading.Thread(target=OutputWorker.membership_write_worker, args=(group_q, 'groups', groups_file))
+        computer_worker = threading.Thread(target=OutputWorker.membership_write_worker, args=(computer_q, 'computers', computers_file))
+        for w in (user_worker, group_worker, computer_worker):
+            w.daemon = True
+            w.start()
+
+        if acl and not self.disable_pooling:
+            self.aclenumerator.init_pool()
+
+        total_locations = len(self.state.locations)
+        completed_count = len(self.state.completed_locations)
+        logging.info('Per-location enumeration: %d/%d locations remaining',
+                     total_locations - completed_count, total_locations)
+
+        highvalue_sids = ["S-1-5-32-544", "S-1-5-32-550", "S-1-5-32-549", "S-1-5-32-551", "S-1-5-32-548"]
+
+        for location_idx, dn in enumerate(self.state.locations):
+            if self.state.is_location_complete(dn):
+                logging.debug('Skipping completed location: %s', dn)
+                continue
+
+            logging.info('Enumerating location %d/%d: %s', location_idx + 1, total_locations, dn)
+            entries = self.addc.get_objects_in_location(dn, include_properties=with_properties, acl=acl)
+            counts = {"users": 0, "groups": 0, "computers": 0}
+
+            for entry in self.interruptible(entries):
+                resolved_entry = ADUtils.resolve_ad_entry(entry)
+                entry_dn = ADUtils.get_entry_property(entry, 'distinguishedName')
+                obj_type = resolved_entry['type']
+
+                if obj_type == 'trustaccount':
+                    continue
+
+                if obj_type == 'User':
+                    counts["users"] += 1
+                    user = {
+                        "AllowedToDelegate": [],
+                        "ObjectIdentifier": ADUtils.get_entry_property(entry, 'objectSid'),
+                        "PrimaryGroupSID": MembershipEnumerator.get_primary_membership(entry),
+                        "ContainedBy": None,
+                        "Properties": {
+                            "name": resolved_entry['principal'],
+                            "domain": self.addomain.domain.upper(),
+                            "domainsid": self.addomain.domain_object.sid,
+                            "highvalue": False,
+                            "distinguishedname": ADUtils.get_entry_property(entry, 'distinguishedName').upper(),
+                            "unconstraineddelegation": ADUtils.get_entry_property(entry, 'userAccountControl', default=0) & 0x00080000 == 0x00080000,
+                            "trustedtoauth": ADUtils.get_entry_property(entry, 'userAccountControl', default=0) & 0x01000000 == 0x01000000,
+                            "passwordnotreqd": ADUtils.get_entry_property(entry, 'userAccountControl', default=0) & 0x00000020 == 0x00000020
+                        },
+                        "Aces": [],
+                        "SPNTargets": [],
+                        "HasSIDHistory": [],
+                        "IsDeleted": ADUtils.get_entry_property(entry, 'isDeleted', default=False)
+                    }
+                    if with_properties:
+                        MembershipEnumerator.add_user_properties(user, entry)
+                        if 'allowedtodelegate' in user['Properties']:
+                            delegatehosts_cache = []
+                            for host in user['Properties']['allowedtodelegate']:
+                                try:
+                                    target = host.split('/')[1]
+                                except IndexError:
+                                    logging.warning('Invalid delegation target: %s', host)
+                                    continue
+                                try:
+                                    object_sid = self.addomain.computersidcache.get(target.lower())
+                                    user['AllowedToDelegate'].append({
+                                        'ObjectIdentifier': object_sid,
+                                        'ObjectType': ADUtils.resolve_ad_entry(
+                                            self.addomain.objectresolver.resolve_sid(object_sid)
+                                        )['type'],
+                                    })
+                                except KeyError:
+                                    object_sam = target.upper().split(".")[0].split("\\")[0]
+                                    if object_sam in delegatehosts_cache: continue
+                                    delegatehosts_cache.append(object_sam)
+                                    object_entry = self.addomain.objectresolver.resolve_samname(object_sam + '*', allow_filter=True)
+                                    if object_entry:
+                                        object_resolved = ADUtils.resolve_ad_entry(object_entry[0])
+                                        user['AllowedToDelegate'].append({
+                                            'ObjectIdentifier': object_resolved['objectid'],
+                                            'ObjectType': object_resolved['type'],
+                                        })
+                        if len(user['Properties']['sidhistory']) > 0:
+                            for historysid in user['Properties']['sidhistory']:
+                                user['HasSIDHistory'].append(self.aceresolver.resolve_sid(historysid))
+                    if ADUtils.get_entry_property(entry, 'msDS-GroupMSAMembership', default=b'', raw=True) != b'':
+                        self.parse_gmsa(user, entry)
+                    linkentry = {
+                        "ObjectIdentifier": resolved_entry['objectid'],
+                        "ObjectType": resolved_entry['type'].capitalize()
+                    }
+                    self.addomain.dncache[entry['dn'].upper()] = linkentry
+                    if acl:
+                        if self.disable_pooling:
+                            self.process_acldata_to_queue(user_q)(parse_binary_acl(user, 'user', ADUtils.get_entry_property(entry, 'nTSecurityDescriptor', raw=True), self.addc.objecttype_guid_map))
+                        else:
+                            self.aclenumerator.pool.apply_async(parse_binary_acl, args=(user, 'user', ADUtils.get_entry_property(entry, 'nTSecurityDescriptor', raw=True), self.addc.objecttype_guid_map), callback=self.process_acldata_to_queue(user_q))
+                    else:
+                        user_q.put(user)
+
+                elif obj_type == 'Group':
+                    counts["groups"] += 1
+                    sid = ADUtils.get_entry_property(entry, 'objectSid')
+                    if not sid:
+                        logging.warning('Could not determine SID for group %s', entry_dn)
+                        continue
+                    is_hv = sid.endswith("-512") or sid.endswith("-516") or sid.endswith("-519") or sid in highvalue_sids
+                    group = {
+                        "ObjectIdentifier": sid,
+                        "Properties": {
+                            "domain": self.addomain.domain.upper(),
+                            "domainsid": self.addomain.domain_object.sid,
+                            "highvalue": is_hv,
+                            "name": resolved_entry['principal'],
+                            "distinguishedname": ADUtils.get_entry_property(entry, 'distinguishedName').upper()
+                        },
+                        "ContainedBy": None,
+                        "Members": [],
+                        "Aces": [],
+                        "IsDeleted": ADUtils.get_entry_property(entry, 'isDeleted', default=False)
+                    }
+                    if sid in ADUtils.WELLKNOWN_SIDS:
+                        group['ObjectIdentifier'] = '%s-%s' % (self.addomain.domain.upper(), sid)
+                    if with_properties:
+                        group['Properties']['admincount'] = ADUtils.get_entry_property(entry, 'adminCount', default=0) == 1
+                        group['Properties']['description'] = ADUtils.get_entry_property(entry, 'description')
+                        group['Properties']['samaccountname'] = ADUtils.get_entry_property(entry, 'sAMAccountName')
+                        whencreated = ADUtils.get_entry_property(entry, 'whencreated', default=0)
+                        if isinstance(whencreated, int):
+                            group['Properties']['whencreated'] = whencreated
+                        else:
+                            group['Properties']['whencreated'] = calendar.timegm(whencreated.timetuple())
+                    for member in ADUtils.get_entry_property(entry, 'member', []):
+                        resolved_member = self.get_membership(member)
+                        if resolved_member:
+                            group['Members'].append(resolved_member)
+                    link_output = {
+                        "ObjectIdentifier": group['ObjectIdentifier'],
+                        "ObjectType": 'Group'
+                    }
+                    self.addomain.dncache[ADUtils.get_entry_property(entry, 'distinguishedName').upper()] = link_output
+                    if acl:
+                        if self.disable_pooling:
+                            self.process_acldata_to_queue(group_q)(parse_binary_acl(group, 'group', ADUtils.get_entry_property(entry, 'nTSecurityDescriptor', raw=True), self.addc.objecttype_guid_map))
+                        else:
+                            self.aclenumerator.pool.apply_async(parse_binary_acl, args=(group, 'group', ADUtils.get_entry_property(entry, 'nTSecurityDescriptor', raw=True), self.addc.objecttype_guid_map), callback=self.process_acldata_to_queue(group_q))
+                    else:
+                        group_q.put(group)
+
+                elif obj_type == 'Computer':
+                    counts["computers"] += 1
+                    hostname = ADUtils.get_entry_property(entry, 'dNSHostName')
+                    samname = ADUtils.get_entry_property(entry, 'sAMAccountName')
+                    if not hostname:
+                        hostname = ''
+                    cobject = ADComputer(hostname=hostname, samname=samname, ad=self.addomain, addc=self.addc, objectsid=entry['attributes']['objectSid'])
+                    cobject.primarygroup = MembershipEnumerator.get_primary_membership(entry)
+                    computer = cobject.get_bloodhound_data(entry, self.collect, skip_acl=True)
+                    if acl:
+                        if self.disable_pooling:
+                            self.process_acldata_to_queue(computer_q)(parse_binary_acl(computer, 'computer', ADUtils.get_entry_property(entry, 'nTSecurityDescriptor', raw=True), self.addc.objecttype_guid_map))
+                        else:
+                            self.aclenumerator.pool.apply_async(parse_binary_acl, args=(computer, 'computer', ADUtils.get_entry_property(entry, 'nTSecurityDescriptor', raw=True), self.addc.objecttype_guid_map), callback=self.process_acldata_to_queue(computer_q))
+                    else:
+                        computer_q.put(computer)
+
+                if entry_dn:
+                    self.state.record_entry(entry_dn)
+
+            if self.interrupted:
+                break
+
+            self.state.mark_location_complete(dn, counts)
+            logging.info('Location complete: %s (users=%d, groups=%d, computers=%d)',
+                         dn, counts['users'], counts['groups'], counts['computers'])
+
+        if acl and not self.disable_pooling:
+            self.aclenumerator.pool.close()
+            self.aclenumerator.pool.join()
+
+        user_q.put(None)
+        user_q.join()
+
+        group_q.put(None)
+        group_q.join()
+
+        computer_q.put(None)
+        computer_q.join()
+
+        if not self.interrupted:
+            self.state.mark_phase_complete('per_location')
+        logging.info('Per-location enumeration finished')
+        self.raise_if_interrupted()
+
+    def process_acldata_to_queue(self, target_queue):
+        def callback(result):
+            data, aces = result
+            data['Aces'] += self.aceresolver.resolve_aces(aces)
+            target_queue.put(data)
+        return callback
+
     def enumerate_users(self, timestamp="", fileNamePrefix=""):
+        if self.state.is_phase_complete('users'):
+            logging.info('Skipping users enumeration (already complete in state file)')
+            return
+
+        is_gapfill = self.state.is_phase_complete('per_location')
+        suffix = 'gapfill_users.json' if is_gapfill else 'users.json'
         if (fileNamePrefix != None):
-            filename = fileNamePrefix + "_" + timestamp + 'users.json'
+            filename = fileNamePrefix + "_" + timestamp + suffix
         else:
-            filename = timestamp + 'users.json'
+            filename = timestamp + suffix
 
         # Should we include extra properties in the query?
         with_properties = 'objectprops' in self.collect
         acl = 'acl' in self.collect
-        entries = self.interruptible(self.addc.get_users(include_properties=with_properties, acl=acl))
+        entries = self.addc.get_users(include_properties=with_properties, acl=acl)
 
         logging.debug('Writing users to file: %s', filename)
 
@@ -168,11 +400,22 @@ class MembershipEnumerator(object):
         if acl and not self.disable_pooling:
             self.aclenumerator.init_pool()
 
+        gap_fill_skipped = 0
         # This loops over a generator, results are fetched from LDAP on the go
-        for entry in entries:
+        for entry in self.interruptible(entries):
             resolved_entry = ADUtils.resolve_ad_entry(entry)
             # Skip trust objects
             if resolved_entry['type'] == 'trustaccount':
+                continue
+            # Gap-fill: skip entries already processed during per-location enumeration
+            entry_dn = ADUtils.get_entry_property(entry, 'distinguishedName')
+            if entry_dn and self.state.is_entry_processed(entry_dn):
+                linkentry = {
+                    "ObjectIdentifier": resolved_entry['objectid'],
+                    "ObjectType": resolved_entry['type'].capitalize()
+                }
+                self.addomain.dncache[entry['dn'].upper()] = linkentry
+                gap_fill_skipped += 1
                 continue
             user = {
                 "AllowedToDelegate": [],
@@ -267,11 +510,18 @@ class MembershipEnumerator(object):
         else:
             self.result_q.put(None)
         self.result_q.join()
+
+        if gap_fill_skipped > 0:
+            logging.info('Gap-fill users: skipped %d already-processed entries', gap_fill_skipped)
+        if not self.interrupted:
+            self.state.mark_phase_complete('users')
+        logging.debug('Finished writing users')
         self.raise_if_interrupted()
 
-        logging.debug('Finished writing users')
-
     def enumerate_groups(self, timestamp="", fileNamePrefix=""):
+        if self.state.is_phase_complete('groups'):
+            logging.info('Skipping groups enumeration (already complete in state file)')
+            return
 
         highvalue = ["S-1-5-32-544", "S-1-5-32-550", "S-1-5-32-549", "S-1-5-32-551", "S-1-5-32-548"]
 
@@ -285,11 +535,13 @@ class MembershipEnumerator(object):
         # Should we include extra properties in the query?
         with_properties = 'objectprops' in self.collect
         acl = 'acl' in self.collect
+        is_gapfill = self.state.is_phase_complete('per_location')
+        suffix = 'gapfill_groups.json' if is_gapfill else 'groups.json'
         if (fileNamePrefix != None):
-            filename = fileNamePrefix + "_" + timestamp + 'groups.json'
+            filename = fileNamePrefix + "_" + timestamp + suffix
         else:
-            filename = timestamp + 'groups.json'
-        entries = self.interruptible(self.addc.get_groups(include_properties=with_properties, acl=acl))
+            filename = timestamp + suffix
+        entries = self.addc.get_groups(include_properties=with_properties, acl=acl)
 
         logging.debug('Writing groups to file: %s', filename)
 
@@ -302,8 +554,19 @@ class MembershipEnumerator(object):
         if acl and not self.disable_pooling:
             self.aclenumerator.init_pool()
 
-        for entry in entries:
+        gap_fill_skipped = 0
+        for entry in self.interruptible(entries):
             resolved_entry = ADUtils.resolve_ad_entry(entry)
+            # Gap-fill: skip entries already processed during per-location enumeration
+            entry_dn = ADUtils.get_entry_property(entry, 'distinguishedName')
+            if entry_dn and self.state.is_entry_processed(entry_dn):
+                link_output = {
+                    "ObjectIdentifier": resolved_entry['objectid'],
+                    "ObjectType": 'Group'
+                }
+                self.addomain.dncache[entry_dn.upper()] = link_output
+                gap_fill_skipped += 1
+                continue
             try:
                 sid = entry['attributes']['objectSid']
             except KeyError:
@@ -374,24 +637,34 @@ class MembershipEnumerator(object):
         else:
             self.result_q.put(None)
         self.result_q.join()
-        self.raise_if_interrupted()
 
+        if gap_fill_skipped > 0:
+            logging.info('Gap-fill groups: skipped %d already-processed entries', gap_fill_skipped)
+        if not self.interrupted:
+            self.state.mark_phase_complete('groups')
         logging.debug('Finished writing groups')
+        self.raise_if_interrupted()
 
     def enumerate_computers_dconly(self,timestamp ="", fileNamePrefix=""):
         '''
         Enumerate computer objects. This function is only used if no
         collection was requested that required connecting to computers anyway.
         '''
+        if self.state.is_phase_complete('computers_dconly'):
+            logging.info('Skipping DC-only computer enumeration (already complete in state file)')
+            return
+
+        is_gapfill = self.state.is_phase_complete('per_location')
+        suffix = 'gapfill_computers.json' if is_gapfill else 'computers.json'
         if (fileNamePrefix != None):
-            filename = fileNamePrefix + "_" + timestamp + 'computers.json'
+            filename = fileNamePrefix + "_" + timestamp + suffix
         else:
-            filename = timestamp + 'computers.json'
+            filename = timestamp + suffix
         # Should we include extra properties in the query?
         with_properties = 'objectprops' in self.collect
         acl = 'acl' in self.collect
 
-        entries = self.interruptible(self.addc.get_computers(include_properties=with_properties, acl=acl))
+        entries = self.addc.get_computers(include_properties=with_properties, acl=acl)
 
         logging.debug('Writing computers ACL to file: %s', filename)
 
@@ -404,9 +677,16 @@ class MembershipEnumerator(object):
         if acl and not self.disable_pooling:
             self.aclenumerator.init_pool()
 
+        gap_fill_skipped = 0
         # This loops over the cached entries
-        for entry in entries:
+        for entry in self.interruptible(entries):
             if not 'attributes' in entry:
+                continue
+
+            # Gap-fill: skip entries already processed during per-location enumeration
+            entry_dn = ADUtils.get_entry_property(entry, 'distinguishedName')
+            if entry_dn and self.state.is_entry_processed(entry_dn):
+                gap_fill_skipped += 1
                 continue
 
             hostname = ADUtils.get_entry_property(entry, 'dNSHostName')
@@ -442,11 +722,19 @@ class MembershipEnumerator(object):
         else:
             self.result_q.put(None)
         self.result_q.join()
+
+        if gap_fill_skipped > 0:
+            logging.info('Gap-fill computers: skipped %d already-processed entries', gap_fill_skipped)
+        if not self.interrupted:
+            self.state.mark_phase_complete('computers_dconly')
+        logging.debug('Finished writing computers')
         self.raise_if_interrupted()
 
-        logging.debug('Finished writing computers')
-
     def enumerate_gpos(self, timestamp ="", fileNamePrefix=""):
+        if self.state.is_phase_complete('gpos'):
+            logging.info('Skipping GPO enumeration (already complete in state file)')
+            return
+
         if (fileNamePrefix != None):
             filename = fileNamePrefix + "_" + timestamp + 'gpos.json'
         else:
@@ -454,7 +742,7 @@ class MembershipEnumerator(object):
 
         with_properties = 'objectprops' in self.collect
         acl = 'acl' in self.collect
-        entries = self.interruptible(self.addc.get_gpos(include_properties=with_properties, acl=acl))
+        entries = self.addc.get_gpos(include_properties=with_properties, acl=acl)
 
         logging.debug('Writing GPOs to file: %s', filename)
 
@@ -467,7 +755,7 @@ class MembershipEnumerator(object):
         if acl and not self.disable_pooling:
             self.aclenumerator.init_pool()
 
-        for entry in entries:
+        for entry in self.interruptible(entries):
             resolved_entry = ADUtils.resolve_ad_entry(entry)
             try:
                 guid = entry['attributes']['objectGUID'][1:-1].upper()
@@ -530,18 +818,24 @@ class MembershipEnumerator(object):
         else:
             self.result_q.put(None)
         self.result_q.join()
+
+        if not self.interrupted:
+            self.state.mark_phase_complete('gpos')
+        logging.debug('Finished writing GPO')
         self.raise_if_interrupted()
 
-        logging.debug('Finished writing GPO')
-
     def enumerate_ous(self, timestamp ="", fileNamePrefix=""):
+        if self.state.is_phase_complete('ous'):
+            logging.info('Skipping OU enumeration (already complete in state file)')
+            return
+
         if (fileNamePrefix != None):
             filename = fileNamePrefix + "_" + timestamp + 'ous.json'
         else:
             filename = timestamp + 'ous.json'
         with_properties = 'objectprops' in self.collect
         acl = 'acl' in self.collect
-        entries = self.interruptible(self.addc.get_ous(include_properties=with_properties, acl=acl))
+        entries = self.addc.get_ous(include_properties=with_properties, acl=acl)
 
         logging.debug('Writing OU to file: %s', filename)
 
@@ -554,7 +848,7 @@ class MembershipEnumerator(object):
         if acl and not self.disable_pooling:
             self.aclenumerator.init_pool()
 
-        for entry in entries:
+        for entry in self.interruptible(entries):
             resolved_entry = ADUtils.resolve_ad_entry(entry)
             try:
                 guid = entry['attributes']['objectGUID'][1:-1].upper()
@@ -596,38 +890,25 @@ class MembershipEnumerator(object):
                 else:
                     ou['Properties']['whencreated'] = calendar.timegm(whencreated.timetuple())
             
-            oudn = ou["Properties"]["distinguishedname"]
-            enumstate = self.addomain.enumstate
-            if enumstate is not None and enumstate.is_done(oudn):
-                # Already enumerated in an earlier (throttled) run - reuse it
-                ou["ChildObjects"] = enumstate.children(oudn)
-                logging.debug('Resuming: reusing %d cached child objects for %s', len(ou["ChildObjects"]), oudn)
+            dn = ou["Properties"]["distinguishedname"]
+            cached_children = self.state.get_cached_children(dn)
+            if cached_children is not None:
+                logging.debug('Using cached child objects for %s', dn)
+                ou["ChildObjects"] = cached_children
             else:
-                childrecords = []
-                for childentry in self.interruptible(self.addc.get_childobjects(oudn)):
+                children = []
+                for childentry in self.addc.get_childobjects(dn):
                     resolved_childentry = ADUtils.resolve_ad_entry(childentry)
-                    # Skip children with empty ID because it breaks ingestion
                     if not resolved_childentry['objectid']:
                         continue
                     out_object = {
                         "ObjectIdentifier":resolved_childentry['objectid'],
                         "ObjectType":resolved_childentry['type']
                     }
-                    ou["ChildObjects"].append(out_object)
-                    childrecord = dict(out_object)
-                    childrecord["dn"] = ADUtils.get_entry_property(childentry, 'distinguishedName', '').upper()
-                    childrecords.append(childrecord)
-                if self.interrupted:
-                    # Only part of this OU's children came back - writing it would
-                    # emit a truncated record and marking it done would hide that
-                    # on a resumed run, so drop it and let the resume redo this one
-                    continue
-                if enumstate is not None:
-                    # Checkpoint per parent, so an interrupted run resumes from here
-                    # instead of re-querying the children of every OU
-                    enumstate.mark_done(oudn, 'ou', childrecords)
-                    enumstate.save()
-            
+                    children.append(out_object)
+                ou["ChildObjects"] = children
+                self.state.record_children(dn, children)
+
             for gplink_dn, option in ADUtils.parse_gplink_string(ADUtils.get_entry_property(entry, 'gPLink', '')):
                 if option == 0 or option == 2:
                     link = dict()
@@ -672,18 +953,24 @@ class MembershipEnumerator(object):
         else:
             self.result_q.put(None)
         self.result_q.join()
+
+        if not self.interrupted:
+            self.state.mark_phase_complete('ous')
+        logging.debug('Finished writing OU')
         self.raise_if_interrupted()
 
-        logging.debug('Finished writing OU')
-
     def enumerate_containers(self, timestamp ="", fileNamePrefix=""):
+        if self.state.is_phase_complete('containers'):
+            logging.info('Skipping container enumeration (already complete in state file)')
+            return
+
         if (fileNamePrefix != None):
             filename = fileNamePrefix + "_" + timestamp + 'containers.json'
         else:
             filename = timestamp + 'containers.json'
         with_properties = 'objectprops' in self.collect
         acl = 'acl' in self.collect
-        entries = self.interruptible(self.addc.get_containers(include_properties=with_properties, acl=acl))
+        entries = self.addc.get_containers(include_properties=with_properties, acl=acl)
 
         logging.debug('Writing containers to file: %s', filename)
 
@@ -696,7 +983,7 @@ class MembershipEnumerator(object):
         if acl and not self.disable_pooling:
             self.aclenumerator.init_pool()
 
-        for entry in entries:
+        for entry in self.interruptible(entries):
             if ADUtils.is_filtered_container(ADUtils.get_entry_property(entry, 'distinguishedName')):
                 continue
             resolved_entry = ADUtils.resolve_ad_entry(entry)
@@ -728,38 +1015,27 @@ class MembershipEnumerator(object):
                 whencreated = ADUtils.get_entry_property(entry, 'whencreated', default=0)
                 container["Properties"]["whencreated"] =  calendar.timegm(whencreated.timetuple())
             
-            containerdn = container["Properties"]["distinguishedname"]
-            enumstate = self.addomain.enumstate
-            if enumstate is not None and enumstate.is_done(containerdn):
-                # Already enumerated in an earlier (throttled) run - reuse it
-                container["ChildObjects"] = enumstate.children(containerdn)
-                logging.debug('Resuming: reusing %d cached child objects for %s', len(container["ChildObjects"]), containerdn)
+            dn = container["Properties"]["distinguishedname"]
+            cached_children = self.state.get_cached_children(dn)
+            if cached_children is not None:
+                logging.debug('Using cached child objects for %s', dn)
+                container["ChildObjects"] = cached_children
             else:
-                childrecords = []
-                for childentry in self.interruptible(self.addc.get_childobjects(containerdn)):
+                children = []
+                for childentry in self.addc.get_childobjects(dn):
                     if ADUtils.is_filtered_container_child(ADUtils.get_entry_property(childentry, 'distinguishedName')):
                         continue
                     resolved_childentry = ADUtils.resolve_ad_entry(childentry)
-                    # Skip children with empty ID because it breaks ingestion
                     if not resolved_childentry['objectid']:
                         continue
                     childobject = {
                         "ObjectIdentifier":resolved_childentry['objectid'],
                         "ObjectType":resolved_childentry['type']
                     }
-                    container["ChildObjects"].append(childobject)
-                    childrecord = dict(childobject)
-                    childrecord["dn"] = ADUtils.get_entry_property(childentry, 'distinguishedName', '').upper()
-                    childrecords.append(childrecord)
-                if self.interrupted:
-                    # Partial children - drop the record so the resume re-queries it
-                    continue
-                if enumstate is not None:
-                    # Filtered children are excluded above, so they never reach the
-                    # state file and are not resurrected on a resumed run
-                    enumstate.mark_done(containerdn, 'container', childrecords)
-                    enumstate.save()
-            
+                    children.append(childobject)
+                container["ChildObjects"] = children
+                self.state.record_children(dn, children)
+
             # Create cache entry for links
             link_output = {
                 "ObjectIdentifier": container['ObjectIdentifier'],
@@ -790,9 +1066,11 @@ class MembershipEnumerator(object):
         else:
             self.result_q.put(None)
         self.result_q.join()
-        self.raise_if_interrupted()
 
+        if not self.interrupted:
+            self.state.mark_phase_complete('containers')
         logging.debug('Finished writing containers')
+        self.raise_if_interrupted()
 
     def parse_gmsa(self, user, entry):
         """
@@ -933,6 +1211,8 @@ class MembershipEnumerator(object):
         """
         Run appropriate enumeration tasks
         """
+        if self.state.enabled:
+            self.enumerate_per_location(timestamp, fileNamePrefix)
         self.enumerate_users(timestamp, fileNamePrefix)
         self.enumerate_groups(timestamp, fileNamePrefix)
         if 'container' in self.collect:

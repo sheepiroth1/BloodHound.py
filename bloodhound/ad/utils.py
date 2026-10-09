@@ -585,7 +585,6 @@ class SidCache(object):
     def load(self, cache):
         self._cache = cache
 
-    # Copy the cache out for writing to disk
     def as_dict(self):
         with self.lock:
             return dict(self._cache)
