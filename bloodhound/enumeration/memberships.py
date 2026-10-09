@@ -348,8 +348,12 @@ class MembershipEnumerator(object):
                          dn, counts['users'], counts['groups'], counts['computers'])
 
         if acl and not self.disable_pooling:
-            self.aclenumerator.pool.close()
+            if self.interrupted:
+                self.aclenumerator.pool.terminate()
+            else:
+                self.aclenumerator.pool.close()
             self.aclenumerator.pool.join()
+            self.aclenumerator.pool = None
 
         user_q.put(None)
         user_q.join()
@@ -501,11 +505,13 @@ class MembershipEnumerator(object):
 
         self.write_default_users()
 
-        # If we are parsing ACLs, close the parsing pool first
-        # then close the result queue and join it
         if acl and not self.disable_pooling:
-            self.aclenumerator.pool.close()
+            if self.interrupted:
+                self.aclenumerator.pool.terminate()
+            else:
+                self.aclenumerator.pool.close()
             self.aclenumerator.pool.join()
+            self.aclenumerator.pool = None
             self.result_q.put(None)
         else:
             self.result_q.put(None)
@@ -628,11 +634,13 @@ class MembershipEnumerator(object):
 
         self.write_default_groups()
 
-        # If we are parsing ACLs, close the parsing pool first
-        # then close the result queue and join it
         if acl and not self.disable_pooling:
-            self.aclenumerator.pool.close()
+            if self.interrupted:
+                self.aclenumerator.pool.terminate()
+            else:
+                self.aclenumerator.pool.close()
             self.aclenumerator.pool.join()
+            self.aclenumerator.pool = None
             self.result_q.put(None)
         else:
             self.result_q.put(None)
@@ -713,11 +721,13 @@ class MembershipEnumerator(object):
                 # this is solely for consistency with acl parsing, the performance improvement is probably minimal
                 self.result_q.put(computer)
 
-        # If we are parsing ACLs, close the parsing pool first
-        # then close the result queue and join it
         if acl and not self.disable_pooling:
-            self.aclenumerator.pool.close()
+            if self.interrupted:
+                self.aclenumerator.pool.terminate()
+            else:
+                self.aclenumerator.pool.close()
             self.aclenumerator.pool.join()
+            self.aclenumerator.pool = None
             self.result_q.put(None)
         else:
             self.result_q.put(None)
@@ -809,11 +819,13 @@ class MembershipEnumerator(object):
 
             # self.write_default_groups()
 
-        # If we are parsing ACLs, close the parsing pool first
-        # then close the result queue and join it
         if acl and not self.disable_pooling:
-            self.aclenumerator.pool.close()
+            if self.interrupted:
+                self.aclenumerator.pool.terminate()
+            else:
+                self.aclenumerator.pool.close()
             self.aclenumerator.pool.join()
+            self.aclenumerator.pool = None
             self.result_q.put(None)
         else:
             self.result_q.put(None)
@@ -944,11 +956,13 @@ class MembershipEnumerator(object):
 
             # self.write_default_groups()
 
-        # If we are parsing ACLs, close the parsing pool first
-        # then close the result queue and join it
         if acl and not self.disable_pooling:
-            self.aclenumerator.pool.close()
+            if self.interrupted:
+                self.aclenumerator.pool.terminate()
+            else:
+                self.aclenumerator.pool.close()
             self.aclenumerator.pool.join()
+            self.aclenumerator.pool = None
             self.result_q.put(None)
         else:
             self.result_q.put(None)
@@ -1057,11 +1071,13 @@ class MembershipEnumerator(object):
                 # this is solely for consistency with acl parsing, the performance improvement is probably minimal
                 self.result_q.put(container)
 
-        # If we are parsing ACLs, close the parsing pool first
-        # then close the result queue and join it
         if acl and not self.disable_pooling:
-            self.aclenumerator.pool.close()
+            if self.interrupted:
+                self.aclenumerator.pool.terminate()
+            else:
+                self.aclenumerator.pool.close()
             self.aclenumerator.pool.join()
+            self.aclenumerator.pool = None
             self.result_q.put(None)
         else:
             self.result_q.put(None)
