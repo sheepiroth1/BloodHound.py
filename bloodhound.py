@@ -8,4 +8,5 @@ sys.path.insert(0, ROOT)
 
 import bloodhound
 
-bloodhound.main()
+if __name__ == '__main__':
+    bloodhound.main()

@@ -22,6 +22,7 @@
 #
 ####################
 import logging
+import multiprocessing
 from multiprocessing import Pool
 from impacket.uuid import string_to_bin, bin_to_string
 from bloodhound.lib import cstruct
@@ -300,7 +301,8 @@ class AclEnumerator(object):
         self.pool = None
 
     def init_pool(self):
-        self.pool = Pool()
+        ctx = multiprocessing.get_context('fork')
+        self.pool = ctx.Pool()
 
 """
 The following is Security Descriptor parsing using cstruct
