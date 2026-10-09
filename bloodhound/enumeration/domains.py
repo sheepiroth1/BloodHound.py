@@ -130,16 +130,36 @@ class DomainEnumerator(object):
             },
             "IsDeleted": False,
         }
+        domaindn = ADUtils.get_entry_property(domain_object, 'distinguishedName').upper()
+        enumstate = self.addomain.enumstate
+        state_hit = enumstate is not None and enumstate.is_done(domaindn)
+        childrecords = []
+        partial = False
         if 'container' in collect:
-            for childentry in self.addc.get_childobjects(ADUtils.get_entry_property(domain_object, 'distinguishedName')):
-                if ADUtils.is_filtered_container_child(ADUtils.get_entry_property(childentry, 'distinguishedName')):
-                    continue
-                resolved_childentry = ADUtils.resolve_ad_entry(childentry)
-                out_object = {
-                    "ObjectIdentifier": resolved_childentry['objectid'],
-                    "ObjectType": resolved_childentry['type'],
-                }
-                domain["ChildObjects"].append(out_object)
+            if state_hit:
+                # Already enumerated in an earlier (throttled) run - reuse it
+                domain["ChildObjects"] = enumstate.children(domaindn)
+                logging.debug('Resuming: reusing %d cached child objects for %s', len(domain["ChildObjects"]), domaindn)
+            else:
+                try:
+                    for childentry in self.addc.get_childobjects(ADUtils.get_entry_property(domain_object, 'distinguishedName')):
+                        if ADUtils.is_filtered_container_child(ADUtils.get_entry_property(childentry, 'distinguishedName')):
+                            continue
+                        resolved_childentry = ADUtils.resolve_ad_entry(childentry)
+                        out_object = {
+                            "ObjectIdentifier": resolved_childentry['objectid'],
+                            "ObjectType": resolved_childentry['type'],
+                        }
+                        domain["ChildObjects"].append(out_object)
+                        childrecord = dict(out_object)
+                        childrecord["dn"] = ADUtils.get_entry_property(childentry, 'distinguishedName', '').upper()
+                        childrecords.append(childrecord)
+                except KeyboardInterrupt:
+                    # Only part of the child list came back - the domain record
+                    # written below is incomplete, so this parent must not be
+                    # marked done or a resumed run would skip it
+                    partial = True
+                    logging.warning('Interrupted while enumerating domain child objects')
 
         if 'acl' in collect:
             resolver = AceResolver(self.addomain, self.addomain.objectresolver)
@@ -174,3 +194,10 @@ class DomainEnumerator(object):
 
         logging.debug('Finished writing domain info')
         out.close()
+
+        # domains.json is written in one go rather than incrementally, so this
+        # parent is only marked done once the file is closed - otherwise a resumed
+        # run would skip a domain record that was never actually written
+        if enumstate is not None and 'container' in collect and not state_hit and not partial:
+            enumstate.mark_done(domaindn, 'domain', childrecords)
+            enumstate.save()

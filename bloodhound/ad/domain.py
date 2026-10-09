@@ -34,6 +34,7 @@ from ldap3 import ALL_ATTRIBUTES, BASE, SUBTREE, LEVEL
 from ldap3.core.exceptions import LDAPKeyError, LDAPAttributeError, LDAPCursorError, LDAPNoSuchObjectResult, LDAPSocketReceiveError, LDAPSocketSendError, LDAPCommunicationError
 from ldap3.protocol.microsoft import security_descriptor_control
 from bloodhound.ad.utils import ADUtils, DNSCache, SidCache, SamCache, CollectionException
+from bloodhound.ad.throttle import get_page_size
 from bloodhound.ad.computer import ADComputer
 from bloodhound.enumeration.objectresolver import ObjectResolver
 
@@ -197,7 +198,7 @@ class ADDC(ADComputer):
         sresult = searcher.extend.standard.paged_search(search_base,
                                                         search_filter,
                                                         attributes=attributes,
-                                                        paged_size=200,
+                                                        paged_size=get_page_size(),
                                                         search_scope=search_scope,
                                                         controls=controls,
                                                         generator=generator)
@@ -304,7 +305,8 @@ class ADDC(ADComputer):
 
         sresult = self.ldap.extend.standard.paged_search(self.ldap.server.info.other['schemaNamingContext'][0],
                                                          '(objectClass=*)',
-                                                         attributes=['name', 'schemaidguid'])
+                                                         attributes=['name', 'schemaidguid'],
+                                                         paged_size=get_page_size())
         for res in sresult:
             if res['attributes']['schemaIDGUID']:
                 guid = str(UUID(bytes_le=res['attributes']['schemaIDGUID']))
@@ -679,6 +681,8 @@ class AD(object):
         self.computersidcache = SidCache()
         # Object Resolver, initialized later
         self.objectresolver = None
+        # EnumerationState for resumable runs, set by main(). None = no resume.
+        self.enumstate = None
         # Number of domains within the forest
         self.num_domains = 1
         # Does the schema have laps properties
@@ -728,7 +732,24 @@ class AD(object):
         logging.info('Loaded cached DNs and SIDs from cachefile')
 
     def save_cachefile(self, cachefile):
-        pass
+        """
+        Write the DN and SID caches out in the same shape load_cachefile() reads.
+        Both hot resolution paths are cache-first (AceResolver checks newsidcache
+        before querying, get_dn_from_cache_or_ldap checks dncache), so persisting
+        these turns most resolver lookups on a resumed run into zero-query hits.
+        """
+        sidcache = self.newsidcache.as_dict()
+        caches = {
+            'dncache': self.dncache,
+            'sidcache': sidcache,
+        }
+        try:
+            with codecs.open(cachefile, 'w', 'utf-8') as outfile:
+                json.dump(caches, outfile)
+            logging.info('Saved %u DN and %u SID cache entries to %s',
+                         len(self.dncache), len(sidcache), cachefile)
+        except (OSError, TypeError) as e:
+            logging.warning('Could not write cache file %s: %s', cachefile, e)
 
     def dns_resolve(self, domain=None, options=None):
         logging.debug('Querying domain controller information from DNS')

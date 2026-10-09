@@ -26,6 +26,8 @@ import os, sys, logging, argparse, getpass, time, re, datetime
 from zipfile import ZipFile
 from bloodhound.ad.domain import AD, ADDC
 from bloodhound.ad.authentication import ADAuthentication
+from bloodhound.ad.enumstate import EnumerationState
+from bloodhound.ad import throttle as ldapthrottle
 from bloodhound.enumeration.computers import ComputerEnumerator
 from bloodhound.enumeration.memberships import MembershipEnumerator
 from bloodhound.enumeration.domains import DomainEnumerator
@@ -65,44 +67,78 @@ class BloodHound(object):
         self.ad.create_objectresolver(self.pdc)
 
 
-    def run(self, collect, num_workers=10, disable_pooling=False, timestamp="", computerfile="", cachefile=None, exclude_dcs=False, fileNamePrefix=""):
+    def finish_state(self, statefile, interrupted, save_cache=True):
+        """
+        Persist what a later run needs. An interrupted run keeps the enumeration
+        state so it can resume where it stopped. A completed run clears the state
+        so the next invocation enumerates fresh. The resolver cache is kept either
+        way, since it only ever saves queries.
+        """
+        if not statefile:
+            return
+        if save_cache:
+            self.ad.save_cachefile('%s.cache.json' % statefile)
+        if self.ad.enumstate is None:
+            return
+        if interrupted:
+            self.ad.enumstate.save()
+            logging.info('Enumeration state saved to %s - re-run the same command to resume', statefile)
+        else:
+            self.ad.enumstate.reset()
+
+    def run(self, collect, num_workers=10, disable_pooling=False, timestamp="", computerfile="", cachefile=None, exclude_dcs=False, fileNamePrefix="", statefile=None):
         start_time = time.time()
         if cachefile:
             self.ad.load_cachefile(cachefile)
+        elif statefile and os.path.exists('%s.cache.json' % statefile):
+            # Resolver cache written by an earlier run with the same --statefile
+            self.ad.load_cachefile('%s.cache.json' % statefile)
 
         # Check early if we should enumerate computers as well
         do_computer_enum = any(method in collect for method in ['localadmin', 'session', 'loggedon', 'experimental', 'rdp', 'dcom', 'psremote'])
 
-        if 'group' in collect or 'objectprops' in collect or 'acl' in collect:
-            # Fetch domains for later, computers if needed
-            self.pdc.prefetch_info('objectprops' in collect, 'acl' in collect, cache_computers=do_computer_enum)
-            # Initialize enumerator
-            membership_enum = MembershipEnumerator(self.ad, self.pdc, collect, disable_pooling)
-            membership_enum.enumerate_memberships(timestamp=timestamp, fileNamePrefix=fileNamePrefix)
-        elif 'container' in collect:
-            # Fetch domains for later, computers if needed
-            self.pdc.prefetch_info('objectprops' in collect, 'acl' in collect, cache_computers=do_computer_enum)
-            # Initialize enumerator
-            membership_enum = MembershipEnumerator(self.ad, self.pdc, collect, disable_pooling)
-            membership_enum.do_container_collection(timestamp=timestamp)
-        elif do_computer_enum:
-            # We need to know which computers to query regardless
-            # We also need the domains to have a mapping from NETBIOS -> FQDN for local admins
-            self.pdc.prefetch_info('objectprops' in collect, 'acl' in collect, cache_computers=True)
-        elif 'trusts' in collect:
-            # Prefetch domains
-            self.pdc.get_domains('acl' in collect)
-        if 'trusts' in collect or 'acl' in collect or 'objectprops' in collect:
-            trusts_enum = DomainEnumerator(self.ad, self.pdc)
-            trusts_enum.dump_domain(collect,timestamp=timestamp,fileNamePrefix=fileNamePrefix)
-        if do_computer_enum:
-            # If we don't have a GC server, don't use it for deconflictation
-            have_gc = len(self.ad.gcs()) > 0
-            computer_enum = ComputerEnumerator(self.ad, self.pdc, collect, do_gc_lookup=have_gc, computerfile=computerfile, exclude_dcs=exclude_dcs)
-            computer_enum.enumerate_computers(self.ad.computers, num_workers=num_workers, timestamp=timestamp, fileNamePrefix=fileNamePrefix)
+        interrupted = False
+        try:
+            if 'group' in collect or 'objectprops' in collect or 'acl' in collect:
+                # Fetch domains for later, computers if needed
+                self.pdc.prefetch_info('objectprops' in collect, 'acl' in collect, cache_computers=do_computer_enum)
+                # Initialize enumerator
+                membership_enum = MembershipEnumerator(self.ad, self.pdc, collect, disable_pooling)
+                membership_enum.enumerate_memberships(timestamp=timestamp, fileNamePrefix=fileNamePrefix)
+            elif 'container' in collect:
+                # Fetch domains for later, computers if needed
+                self.pdc.prefetch_info('objectprops' in collect, 'acl' in collect, cache_computers=do_computer_enum)
+                # Initialize enumerator
+                membership_enum = MembershipEnumerator(self.ad, self.pdc, collect, disable_pooling)
+                membership_enum.do_container_collection(timestamp=timestamp)
+            elif do_computer_enum:
+                # We need to know which computers to query regardless
+                # We also need the domains to have a mapping from NETBIOS -> FQDN for local admins
+                self.pdc.prefetch_info('objectprops' in collect, 'acl' in collect, cache_computers=True)
+            elif 'trusts' in collect:
+                # Prefetch domains
+                self.pdc.get_domains('acl' in collect)
+            if 'trusts' in collect or 'acl' in collect or 'objectprops' in collect:
+                trusts_enum = DomainEnumerator(self.ad, self.pdc)
+                trusts_enum.dump_domain(collect,timestamp=timestamp,fileNamePrefix=fileNamePrefix)
+            if do_computer_enum:
+                # If we don't have a GC server, don't use it for deconflictation
+                have_gc = len(self.ad.gcs()) > 0
+                computer_enum = ComputerEnumerator(self.ad, self.pdc, collect, do_gc_lookup=have_gc, computerfile=computerfile, exclude_dcs=exclude_dcs)
+                computer_enum.enumerate_computers(self.ad.computers, num_workers=num_workers, timestamp=timestamp, fileNamePrefix=fileNamePrefix)
+        except KeyboardInterrupt:
+            # Output files are already finalized by the enumerators - this only
+            # stops the remaining phases and persists state for a resume
+            interrupted = True
+
+        self.finish_state(statefile, interrupted, save_cache=cachefile is None)
         end_time = time.time()
         minutes, seconds = divmod(int(end_time-start_time),60)
-        logging.info('Done in %02dM %02dS' % (minutes, seconds))
+        if interrupted:
+            logging.info('Stopped after %02dM %02dS', minutes, seconds)
+        else:
+            logging.info('Done in %02dM %02dS' % (minutes, seconds))
+        return not interrupted
 
 def resolve_collection_methods(methods):
     """
@@ -268,9 +304,50 @@ def main():
                         metavar='PREFIX_NAME',
                         action='store',
                         help='String to prepend to output file names')
+    thopts = parser.add_argument_group('throttling and resume options',
+                                       description='Spread the LDAP queries over time and resume an unfinished run')
+    thopts.add_argument('--ldap-delay',
+                        action='store',
+                        type=float,
+                        metavar='MINUTES',
+                        default=0.0,
+                        help='Wait this many minutes between LDAP queries (default: 0, no throttling). '
+                             'Counted per LDAP page, not per query, so a query that returns several pages '
+                             'waits once per page. Fractional values are accepted (0.5 = 30 seconds). '
+                             'Note that connecting to a DC also issues a few queries (rootDSE, schema), '
+                             'so each connection costs a few slots.')
+    thopts.add_argument('--ldap-jitter',
+                        action='store',
+                        type=float,
+                        metavar='MINUTES',
+                        default=0.0,
+                        help='Random extra delay of 0 to this many minutes added to every --ldap-delay '
+                             'interval (default: 0)')
+    thopts.add_argument('--ldap-page-size',
+                        action='store',
+                        type=int,
+                        metavar='ENTRIES',
+                        default=200,
+                        help='Entries per LDAP page (default: 200). Lower it to spread a single query '
+                             'over more, smaller waits; raise it to use fewer waits on large collections')
+    thopts.add_argument('--statefile',
+                        action='store',
+                        metavar='PATH',
+                        default='bh_enum_state_ce.json',
+                        help='File holding which OUs/containers were already enumerated, so an interrupted '
+                             "run can resume (default: bh_enum_state_ce.json). A '<statefile>.cache.json"
+                             "' resolver cache is written next to it and loaded automatically")
+    thopts.add_argument('--reset-state',
+                        action='store_true',
+                        help='Discard any existing state file and enumerate from scratch')
 
     args = parser.parse_args()
     logging.info('BloodHound.py for BloodHound Community Edition')
+
+    ldapthrottle.set_page_size(args.ldap_page_size)
+    if ldapthrottle.set_throttler(args.ldap_delay * 60, args.ldap_jitter * 60):
+        logging.info('Throttling LDAP to one query per %g minute(s) plus up to %g minute(s) jitter',
+                     args.ldap_delay, args.ldap_jitter)
 
     if args.v is True:
         logger.setLevel(logging.DEBUG)
@@ -332,6 +409,18 @@ def main():
             sys.exit(1)
         ad.override_gc(args.global_catalog)
 
+    # Resume support: remember which OUs/containers a previous (throttled) run
+    # already enumerated, so this one can pick up where it stopped
+    enumstate = EnumerationState(args.statefile)
+    if args.reset_state:
+        enumstate.reset()
+    enumstate.load()
+    enumstate.set_target(domain=ad.domain,
+                         dc=(ad.dcs()[0] if ad.dcs() else ''),
+                         collection=collect)
+    enumstate.check_target()
+    ad.enumstate = enumstate
+
     if args.auth_method in ('auto', 'kerberos'):
         if args.kerberos is True:
             if not auth.load_ccache():
@@ -351,7 +440,8 @@ def main():
                    computerfile=args.computerfile,
                    cachefile=args.cachefile,
                    exclude_dcs=args.exclude_dcs,
-                   fileNamePrefix=args.outputprefix)
+                   fileNamePrefix=args.outputprefix,
+                   statefile=args.statefile)
     #If args --zip is true, the compress output  
     if args.zip:
         logging.info("Compressing output into " + timestamp + "bloodhound.zip")
