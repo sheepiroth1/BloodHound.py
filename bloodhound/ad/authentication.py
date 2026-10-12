@@ -28,14 +28,13 @@ import os
 import traceback
 from hashlib import sha256, md5
 from bloodhound.ad.utils import CollectionException
-from bloodhound.ad.throttle import ThrottledConnection
+from bloodhound.ad.throttle import get_ldap_pacer, enable_tcp_keepalive
 from binascii import unhexlify
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 import ldap3
-from ldap3 import Server, Connection, NTLM, ALL, SASL, KERBEROS, Tls
-from bloodhound.ad.throttle import ThrottledConnection
+from ldap3 import Server, Connection, NTLM, ALL, NONE, SASL, KERBEROS, Tls
 from ldap3.core.results import RESULT_STRONGER_AUTH_REQUIRED
 from ldap3.operation.bind import bind_operation
 from impacket.krb5.ccache import CCache
@@ -77,6 +76,9 @@ class ADAuthentication(object):
         # Kerberos
         self.tgt = None
 
+        self._cached_dsa_info = None
+        self._cached_schema_info = None
+
     def set_aeskey(self, aeskey):
         self.aeskey = aeskey
 
@@ -88,6 +90,9 @@ class ADAuthentication(object):
             self.userdomain_kdc = kdc
 
     def getLDAPConnection(self, hostname='', ip='', baseDN='', protocol='ldaps', gc=False):
+        reuse_server_info = (self._cached_dsa_info is not None
+                             and self._cached_schema_info is not None)
+        info_level = NONE if reuse_server_info else ALL
         if gc:
             # Global Catalog connection
             if protocol == 'ldaps' or self.ldap_channel_binding is True:
@@ -101,15 +106,15 @@ class ADAuthentication(object):
                     server = Server(
                         "%s://%s:3269" % (protocol,ip),
                         use_ssl=True,
-                        get_info=ALL,
+                        get_info=info_level,
                         tls=tls
                     )
                 else:
                     # Ldap SSL (no channel binding)
-                    server = Server("%s://%s:3269" % (protocol, ip), get_info=ALL)
+                    server = Server("%s://%s:3269" % (protocol, ip), get_info=info_level)
             else:
                 # Plain LDAP
-                server = Server("%s://%s:3268" % (protocol, ip), get_info=ALL)
+                server = Server("%s://%s:3268" % (protocol, ip), get_info=info_level)
         else: # no GC specified
             if self.ldap_channel_binding is True:
                 if not hasattr(ldap3, 'TLS_CHANNEL_BINDING'):
@@ -121,11 +126,14 @@ class ADAuthentication(object):
                 server = Server(
                     "%s://%s" % (protocol,ip),
                     use_ssl=True,
-                    get_info=ALL,
+                    get_info=info_level,
                     tls=tls
                 )
             else: # No LDAP Channel Binding
-                server = Server("%s://%s" % (protocol, ip), get_info=ALL)
+                server = Server("%s://%s" % (protocol, ip), get_info=info_level)
+        if reuse_server_info:
+            server.attach_dsa_info(self._cached_dsa_info)
+            server.attach_schema_info(self._cached_schema_info)
         # ldap3 supports auth with the NT hash. LM hash is actually ignored since only NTLMv2 is used.
         if self.nt_hash != '':
             if self.lm_hash != '':
@@ -139,7 +147,7 @@ class ADAuthentication(object):
 
         bound = False
         if self.tgt is not None and self.auth_method in ('kerberos', 'auto'):
-            conn = ThrottledConnection(server, user=ldaplogin, auto_referrals=False, password=ldappass, authentication=SASL, sasl_mechanism=KERBEROS, receive_timeout=60, auto_range=True)
+            conn = Connection(server, user=ldaplogin, auto_referrals=False, password=ldappass, authentication=SASL, sasl_mechanism=KERBEROS, receive_timeout=60, auto_range=True)
             logging.debug('Authenticating to LDAP server with Kerberos')
             try:
                 bound = self.ldap_kerberos(conn, hostname)
@@ -153,16 +161,16 @@ class ADAuthentication(object):
                     logging.critical('Kerberos auth to LDAP failed, no authentication methods left')
                     raise CollectionException('Could not authenticate to LDAP. Check your credentials and LDAP server requirements.')
         if not bound and self.auth_method in ('auto','ntlm'):
-            conn = ThrottledConnection(server, user=ldaplogin, auto_referrals=False, password=ldappass, authentication=NTLM, receive_timeout=60, auto_range=True)
+            conn = Connection(server, user=ldaplogin, auto_referrals=False, password=ldappass, authentication=NTLM, receive_timeout=60, auto_range=True)
             logging.debug('Authenticating to LDAP server with NTLM')
             if self.ldap_channel_binding:
                 from ldap3 import TLS_CHANNEL_BINDING
                 logging.debug("Using LDAPS channel binding")
                 protocol = 'ldaps'
                 channel_binding = {"channel_binding": TLS_CHANNEL_BINDING}
-                conn = ThrottledConnection(server, user=ldaplogin, password=ldappass, authentication=NTLM, auto_referrals=False, receive_timeout=60, auto_range=True, **channel_binding)
+                conn = Connection(server, user=ldaplogin, password=ldappass, authentication=NTLM, auto_referrals=False, receive_timeout=60, auto_range=True, **channel_binding)
             else:
-                conn = ThrottledConnection(server, user=ldaplogin, auto_referrals=False, password=ldappass, authentication=NTLM, receive_timeout=60, auto_range=True)
+                conn = Connection(server, user=ldaplogin, auto_referrals=False, password=ldappass, authentication=NTLM, receive_timeout=60, auto_range=True)
             bound = conn.bind()
 
         if not bound:
@@ -179,6 +187,12 @@ class ADAuthentication(object):
             else:
                 logging.error('Failure to authenticate with LDAP! Error %s : Code: %s' % (result['message'], result['result']))
                 raise CollectionException('Could not authenticate to LDAP. Check your credentials and LDAP server requirements.')
+        if not reuse_server_info:
+            if conn.server.info is not None:
+                self._cached_dsa_info = conn.server.info
+            if conn.server.schema is not None:
+                self._cached_schema_info = conn.server.schema
+        enable_tcp_keepalive(conn.socket)
         return conn
 
     def ldap_kerberos(self, connection, hostname):

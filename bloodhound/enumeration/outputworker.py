@@ -25,8 +25,20 @@
 import logging
 import codecs
 import json
+import os
 
 MAX_ENTRIES = 40000
+
+
+def _finalize(handle, final_path):
+    handle.flush()
+    try:
+        os.fsync(handle.fileno())
+    except OSError:
+        pass
+    handle.close()
+    os.replace(handle.name, final_path)
+
 
 class OutputWorker(object):
     @staticmethod
@@ -35,17 +47,16 @@ class OutputWorker(object):
             Worker to write the results from the results_q to the given files.
         """
 
-      
-        computers_out = codecs.open(computers_filename, 'w', 'utf-8')
+        partial = computers_filename + '.partial'
+        computers_out = codecs.open(partial, 'w', 'utf-8')
+        current_final = computers_filename
         filenumber = 0
 
-        # If the logging level is DEBUG, we ident the objects
         if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
             indent_level = 1
         else:
             indent_level = None
 
-        # Write start of the json file
         computers_out.write('{"data":[')
         num_computers = 0
         current_num_computers = 0
@@ -73,22 +84,20 @@ class OutputWorker(object):
                 logging.warning("Type is %s this should not happen", objtype)
 
             result_q.task_done()
-            # Loop file if it gets too big
             if num_computers % MAX_ENTRIES == 0 and num_computers > 0:
                 logging.debug('Rotating output file %s', computers_filename)
                 computers_out.write('],"meta":{"methods":0,"type":"computers","count":%d, "version":6}}' % current_num_computers)
-                computers_out.close()
+                _finalize(computers_out, current_final)
                 filenumber += 1
-                new_filename = computers_filename.replace('.json', '_%02d.json' % filenumber)
-                computers_out = codecs.open(new_filename, 'w', 'utf-8')
+                current_final = computers_filename.replace('.json', '_%02d.json' % filenumber)
+                computers_out = codecs.open(current_final + '.partial', 'w', 'utf-8')
                 current_num_computers = 0
                 computers_out.write('{"data":[')
 
 
         logging.debug('Write worker is done, closing files')
-        # Write metadata manually
         computers_out.write('],"meta":{"methods":0,"type":"computers","count":%d, "version":6}}' % current_num_computers)
-        computers_out.close()
+        _finalize(computers_out, current_final)
         result_q.task_done()
 
     @staticmethod
@@ -98,20 +107,20 @@ class OutputWorker(object):
             This is for both users and groups
         """
         try:
-            membership_out = codecs.open(filename, 'w', 'utf-8')
+            partial = filename + '.partial'
+            membership_out = codecs.open(partial, 'w', 'utf-8')
+            current_final = filename
             filenumber = 0
         except:
             logging.warning('Could not write file: %s', filename)
             result_q.task_done()
             return
 
-        # If the logging level is DEBUG, we ident the objects
         if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
             indent_level = 1
         else:
             indent_level = None
 
-        # Write start of the json file
         membership_out.write('{"data":[')
         num_members = 0
         current_num_members = 0
@@ -133,19 +142,17 @@ class OutputWorker(object):
             current_num_members += 1
 
             result_q.task_done()
-            # Loop file if it gets too big
             if num_members % MAX_ENTRIES == 0 and num_members > 0:
                 logging.debug('Rotating output file %s', filename)
                 membership_out.write('],"meta":{"methods":0,"type":"%s","count":%d, "version":6}}' % (enumtype, current_num_members))
-                membership_out.close()
+                _finalize(membership_out, current_final)
                 filenumber += 1
-                new_filename = filename.replace('.json', '_%02d.json' % filenumber)
-                membership_out = codecs.open(new_filename, 'w', 'utf-8')
+                current_final = filename.replace('.json', '_%02d.json' % filenumber)
+                membership_out = codecs.open(current_final + '.partial', 'w', 'utf-8')
                 current_num_members = 0
                 membership_out.write('{"data":[')
 
         logging.info('Found %d %s', num_members, enumtype)
-        # Write metadata manually
         membership_out.write('],"meta":{"methods":0,"type":"%s","count":%d, "version":6}}' % (enumtype, current_num_members))
-        membership_out.close()
+        _finalize(membership_out, current_final)
         result_q.task_done()

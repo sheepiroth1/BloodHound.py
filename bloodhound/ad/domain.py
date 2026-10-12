@@ -35,8 +35,34 @@ from ldap3.core.exceptions import LDAPKeyError, LDAPAttributeError, LDAPCursorEr
 from ldap3.protocol.microsoft import security_descriptor_control
 from bloodhound.ad.utils import ADUtils, DNSCache, SidCache, SamCache, CollectionException
 from bloodhound.ad.computer import ADComputer
-from bloodhound.ad.throttle import get_page_size
+from bloodhound.ad.throttle import get_page_size, get_ldap_pacer
 from bloodhound.enumeration.objectresolver import ObjectResolver
+
+_LDAP_SEARCH_ATTEMPTS = 5
+_PAGED_RESULTS_OID = '1.2.840.113556.1.4.319'
+
+
+def _paging_cookie_rejected(message):
+    text = str(message or '')
+    return (
+        'Error processing control' in text
+        or '00002040' in text
+        or 'UNAVAIL_EXTENSION' in text
+        or 'unavailableCriticalExtension' in text
+    )
+
+
+def _next_page_cookie(result):
+    if not result:
+        return None
+    controls = result.get('controls') or {}
+    try:
+        cookie = controls[_PAGED_RESULTS_OID]['value']['cookie']
+    except (KeyError, TypeError):
+        return None
+    if cookie is None or cookie == b'' or cookie == '':
+        return None
+    return cookie
 
 """
 Active Directory Domain Controller
@@ -162,9 +188,10 @@ class ADDC(ADComputer):
                                                      baseDN=self.ad.baseDN, protocol=protocol)
         return self.gcldap is not None
 
-    def search(self, search_filter='(objectClass=*)',attributes=None, search_base=None, generator=True, use_gc=False, use_resolver=False, query_sd=False, is_retry=False,  search_scope=SUBTREE,):
+    def search(self, search_filter='(objectClass=*)', attributes=None, search_base=None, generator=True, use_gc=False, use_resolver=False, query_sd=False, search_scope=SUBTREE):
         """
         Search for objects in LDAP or Global Catalog LDAP.
+        Pages are requested one at a time with cookie retry on disconnect.
         """
         if self.ldap is None and not use_resolver:
             self.ldap_connect(resolver=use_resolver)
@@ -175,79 +202,99 @@ class ADDC(ADComputer):
         if attributes is None or attributes == []:
             attributes = ALL_ATTRIBUTES
         if query_sd:
-            # Set SD flags to only query for DACL and Owner
             controls = security_descriptor_control(sdflags=0x05)
         else:
             controls = None
 
-        # If we don't query the GC, don't accept an empty search base
         if search_base == "" and not use_gc:
             search_base = self.ad.baseDN
 
-        # Use the GC if this is requested
-        if use_gc:
-            searcher = self.gcldap
-        else:
-            # If this request comes from the resolver thread, use that
-            if use_resolver:
-                searcher = self.resolverldap
-            else:
-                searcher = self.ldap
-
-        logging.debug('LDAP query: base=%s filter=%s scope=%s', search_base, search_filter, search_scope)
-        hadresults = False
-        sresult = searcher.extend.standard.paged_search(search_base,
-                                                        search_filter,
-                                                        attributes=attributes,
-                                                        paged_size=get_page_size(),
-                                                        search_scope=search_scope,
-                                                        controls=controls,
-                                                        generator=generator)
         try:
-            # Use a generator for the result regardless of if the search function uses one
-            for e in sresult:
-                if e['type'] != 'searchResEntry':
-                    continue
-                if not hadresults:
-                    hadresults = True
-                yield e
+            for entry in self._iter_paged(search_base, search_filter, attributes,
+                                          search_scope, controls, get_page_size(),
+                                          use_gc, use_resolver):
+                yield entry
         except LDAPNoSuchObjectResult:
-            # This may indicate the object doesn't exist or access is denied
             logging.warning('LDAP Server reported that the search in %s for %s does not exist.', search_base, search_filter)
-        except (LDAPSocketReceiveError, LDAPSocketSendError, LDAPCommunicationError) as e:
-            if is_retry:
-                logging.error('Connection to LDAP server lost during data gathering - reconnect failed - giving up on query %s', search_filter)
-            else:
-                if hadresults:
-                    logging.error('Connection to LDAP server lost during data gathering. Query was cut short. Data may be inaccurate for query %s', search_filter)
-                    if use_gc:
-                        self.gc_connect()
-                    else:
-                        self.ldap_connect(resolver=use_resolver)
-                else:
-                    logging.warning('Re-establishing connection with server')
-                    if use_gc:
-                        self.gc_connect()
-                    else:
-                        self.ldap_connect(resolver=use_resolver)
-                    # Try again
-                    yield from self.search(search_filter, attributes, search_base, generator, use_gc, use_resolver, query_sd, is_retry=True)
+
+    def _ldap_handle(self, use_gc, use_resolver):
+        if use_gc:
+            return self.gcldap
+        if use_resolver:
+            return self.resolverldap
+        return self.ldap
+
+    def _iter_paged(self, search_base, search_filter, attributes, search_scope,
+                    controls, paged_size, use_gc, use_resolver):
+        cookie = None
+        page = 0
+        failures = 0
+        collected = 0
+        while True:
+            page += 1
+            searcher = self._ldap_handle(use_gc, use_resolver)
+            logging.debug('LDAP page %d for %s (%s paging cookie)',
+                          page, search_filter, 'with' if cookie else 'without')
+            try:
+                searcher.search(search_base=search_base,
+                                search_filter=search_filter,
+                                search_scope=search_scope,
+                                attributes=attributes,
+                                controls=controls,
+                                paged_size=paged_size,
+                                paged_cookie=cookie)
+            except LDAPNoSuchObjectResult:
+                raise
+            except (LDAPSocketReceiveError, LDAPSocketSendError, LDAPCommunicationError):
+                failures += 1
+                self._resume_search(search_filter, use_gc, use_resolver, collected, failures)
+                page -= 1
+                continue
+            result = searcher.result or {}
+            if result.get('result') not in (0, None):
+                message = result.get('message') or result.get('description') or ''
+                if cookie and _paging_cookie_rejected(message):
+                    raise CollectionException(
+                        'The domain controller rejected the paging cookie while collecting %s '
+                        '(%d object(s) already read).' % (search_filter, collected))
+                raise CollectionException('LDAP search %s failed: %s' % (search_filter, message or result))
+            page_entries = [e for e in (searcher.response or [])
+                           if e.get('type') == 'searchResEntry']
+            collected += len(page_entries)
+            if get_ldap_pacer() is not None:
+                logging.info('LDAP page %d, %d objects so far', page, collected)
+            for entry in page_entries:
+                yield entry
+            new_cookie = _next_page_cookie(result)
+            if not new_cookie:
+                logging.debug('LDAP page %d for %s was the last page (%d object(s))',
+                              page, search_filter, collected)
+                return
+            cookie = new_cookie
+            failures = 0
+
+    def _resume_search(self, search_filter, use_gc, use_resolver, collected, attempt):
+        if attempt >= _LDAP_SEARCH_ATTEMPTS:
+            raise CollectionException(
+                'LDAP search did not finish after %d attempts (%d object(s) already read) for %s.'
+                % (attempt, collected, search_filter))
+        logging.warning(
+            'Connection lost during LDAP search (%d object(s) already read). '
+            'Reconnecting %s (attempt %d of %d)',
+            collected, search_filter, attempt + 1, _LDAP_SEARCH_ATTEMPTS)
+        if use_gc:
+            self.gc_connect()
+        else:
+            self.ldap_connect(resolver=use_resolver)
 
 
-    def ldap_get_single(self, qobject, attributes=None, use_gc=False, use_resolver=False, is_retry=False):
+    def ldap_get_single(self, qobject, attributes=None, use_gc=False, use_resolver=False, _attempt=1):
         """
         Get a single object, requires full DN to object.
         This function supports searching both in the local directory and the Global Catalog.
         The connection to the GC should already be established before calling this function.
         """
-        if use_gc:
-            searcher = self.gcldap
-        else:
-            # If this request comes from the resolver thread, use that
-            if use_resolver:
-                searcher = self.resolverldap
-            else:
-                searcher = self.ldap
+        searcher = self._ldap_handle(use_gc, use_resolver)
         if attributes is None or attributes == []:
             attributes = ALL_ATTRIBUTES
         logging.debug('LDAP single lookup: dn=%s', qobject)
@@ -258,20 +305,10 @@ class ADDC(ADComputer):
                                                             attributes=attributes,
                                                             paged_size=10,
                                                             generator=False)
-        except (LDAPSocketReceiveError, LDAPSocketSendError, LDAPCommunicationError) as e:
-            if is_retry:
-                logging.error('Connection to LDAP server lost during object resolving - reconnect failed - giving up on resolving %s', qobject)
-                return None
-            else:
-                logging.warning('Re-establishing connection with server')
-                if use_gc:
-                    self.gc_connect()
-                else:
-                    self.ldap_connect(resolver=use_resolver)
-                # Try again
-                return self.ldap_get_single(qobject, attributes, use_gc, use_resolver, is_retry=True)
+        except (LDAPSocketReceiveError, LDAPSocketSendError, LDAPCommunicationError):
+            self._resume_search(qobject, use_gc, use_resolver, 0, _attempt)
+            return self.ldap_get_single(qobject, attributes, use_gc, use_resolver, _attempt=_attempt + 1)
         except LDAPNoSuchObjectResult:
-            # This may indicate the object doesn't exist or access is denied
             logging.warning('LDAP Server reported that the object %s does not exist.', qobject)
             return None
         for e in sresult:

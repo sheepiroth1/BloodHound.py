@@ -26,7 +26,9 @@ import os, sys, logging, argparse, getpass, time, re, datetime
 from zipfile import ZipFile
 from bloodhound.ad.domain import AD, ADDC
 from bloodhound.ad.authentication import ADAuthentication
-from bloodhound.ad import throttle as ldapthrottle
+from bloodhound.ad.throttle import (parse_duration, parse_host_throttle, format_duration,
+                                     install_ldap_pacing, install_host_pacing,
+                                     install_ldap_search_counter, ldap_search_count)
 from bloodhound.ad.state import EnumerationState
 from bloodhound.enumeration.computers import ComputerEnumerator
 from bloodhound.enumeration.memberships import MembershipEnumerator
@@ -331,21 +333,37 @@ def main():
                         metavar='PREFIX_NAME',
                         action='store',
                         help='String to prepend to output file names')
-    coopts.add_argument('--throttle-interval',
+    coopts.add_argument('--ldap-interval',
+                        action='store',
+                        default=None,
+                        help='Delay between new LDAP searches (e.g. 30, 30s, 5m, 1h). Default: disabled')
+    coopts.add_argument('--ldap-jitter',
                         action='store',
                         type=float,
                         default=0,
-                        help='Seconds to wait between LDAP queries for throttling (default: 0, disabled)')
-    coopts.add_argument('--throttle-jitter-min',
+                        help='Jitter percentage (0-100) added to --ldap-interval (default: 0)')
+    coopts.add_argument('--ldap-page-interval',
+                        action='store',
+                        default=None,
+                        help='Delay between continuation pages of the same search (e.g. 5, 5s, 1m). Default: disabled')
+    coopts.add_argument('--ldap-page-jitter',
                         action='store',
                         type=float,
                         default=0,
-                        help='Minimum random seconds added to throttle interval (default: 0)')
-    coopts.add_argument('--throttle-jitter-max',
+                        help='Jitter percentage (0-100) added to --ldap-page-interval (default: 0)')
+    coopts.add_argument('--throttle',
+                        action='store',
+                        default=None,
+                        help='Delay between host RPC/SMB calls during computer enum (e.g. 500, 500ms, 2s). Default: disabled')
+    coopts.add_argument('--throttle-jitter',
                         action='store',
                         type=float,
                         default=0,
-                        help='Maximum random seconds added to throttle interval (default: 0)')
+                        help='Jitter percentage (0-100) for --throttle, bidirectional (default: 0)')
+    coopts.add_argument('--log-file',
+                        action='store',
+                        metavar='PATH',
+                        help='Write debug-level log to this file (console level unchanged)')
     coopts.add_argument('--state',
                         action='store',
                         dest='state_prefix',
@@ -366,6 +384,13 @@ def main():
 
     if args.v is True:
         logger.setLevel(logging.DEBUG)
+
+    if args.log_file:
+        file_handler = logging.FileHandler(args.log_file, encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
+        logger.addHandler(file_handler)
+        logging.info('Debug log file: %s', args.log_file)
 
     if args.username is not None and args.password is not None:
         logging.debug('Authentication: username/password')
@@ -434,10 +459,20 @@ def main():
 
     # For adding timestamp prefix to the outputfiles 
     timestamp = datetime.datetime.fromtimestamp(time.time()).strftime('%Y%m%d%H%M%S') + "_"
-    if args.throttle_interval > 0:
-        ldapthrottle.set_throttler(args.throttle_interval, args.throttle_jitter_min, args.throttle_jitter_max)
-        logging.info('LDAP throttling enabled: %.1fs interval, jitter %.1f-%.1fs',
-                     args.throttle_interval, args.throttle_jitter_min, args.throttle_jitter_max)
+    ldap_interval = parse_duration(args.ldap_interval, '--ldap-interval')
+    ldap_page_interval = parse_duration(args.ldap_page_interval, '--ldap-page-interval')
+    host_throttle_ms = parse_host_throttle(args.throttle)
+
+    if ldap_interval or ldap_page_interval:
+        pacer = install_ldap_pacing(ldap_interval or 0, args.ldap_jitter,
+                                    ldap_page_interval or 0, args.ldap_page_jitter)
+        logging.info('LDAP pacing: %s', pacer.describe())
+    else:
+        install_ldap_search_counter()
+
+    if host_throttle_ms:
+        hpacer = install_host_pacing(host_throttle_ms, args.throttle_jitter)
+        logging.info('Host pacing: %s', hpacer.describe())
 
     bloodhound = BloodHound(ad)
     bloodhound.connect()
