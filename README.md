@@ -80,9 +80,20 @@ bloodhound-ce-python -u user@domain.local -k -d domain.local -c DCOnly \
 | `--computerfile` | File with FQDNs to limit computer enumeration to |
 | `--search-base` | Custom LDAP search base DN (e.g. `OU=Sales,DC=corp,DC=local`). Limits enumeration scope to a subtree. Trust and domain-level queries still use the domain root |
 
-### LDAP Throttling
+### Throttling
 
-These control how fast LDAP queries are sent. Use them when stealth matters or to avoid rate-limiting.
+There are two independent throttling systems. Which one you need depends on your collection method:
+
+| Collection Method | Talks to | Throttle flags that apply |
+|-------------------|----------|--------------------------|
+| `DCOnly`, `Group`, `Trusts`, `ACL`, `ObjectProps`, `Container` | Domain controller only (LDAP) | `--ldap-interval`, `--ldap-page-interval` |
+| `Session`, `LocalAdmin`, `RDP`, `DCOM`, `PSRemote`, `LoggedOn` | Individual host machines (SMB/RPC) **and** the DC (LDAP) | Both LDAP flags **and** `--throttle` |
+
+> **Rule of thumb:** If you run `-c DCOnly`, only the `--ldap-*` flags matter. The `--throttle` flag is silently ignored because no host connections are made. If you run `-c All` or any computer-targeting method, both sets of flags apply.
+
+#### LDAP pacing (all modes)
+
+Controls how fast LDAP queries are sent to the domain controller. Applies to every collection method.
 
 | Flag | Example | What It Does |
 |------|---------|-------------|
@@ -95,9 +106,9 @@ These control how fast LDAP queries are sent. Use them when stealth matters or t
 
 Duration values accept: plain number (seconds), or suffix `s` (seconds), `m` (minutes), `h` (hours).
 
-### Host RPC Throttling
+#### Host RPC pacing (computer enumeration only — ignored by DCOnly)
 
-Controls timing of SMB/RPC connections during computer enumeration (session, localadmin, rdp, dcom, psremote, loggedon). Only relevant for non-DCOnly collection methods.
+Controls timing of SMB/RPC connections when enumerating individual machines (session, localadmin, rdp, dcom, psremote, loggedon). These flags have **no effect** on DCOnly or any LDAP-only collection method.
 
 | Flag | Example | What It Does |
 |------|---------|-------------|

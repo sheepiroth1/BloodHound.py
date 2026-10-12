@@ -336,30 +336,30 @@ def main():
     coopts.add_argument('--ldap-interval',
                         action='store',
                         default=None,
-                        help='Delay between new LDAP searches (e.g. 30, 30s, 5m, 1h). Default: disabled')
+                        help='[All modes] Delay between new LDAP searches (e.g. 30, 30s, 5m, 1h). Default: disabled')
     coopts.add_argument('--ldap-jitter',
                         action='store',
                         type=float,
                         default=0,
-                        help='Jitter percentage (0-100) added to --ldap-interval (default: 0)')
+                        help='[All modes] Jitter percentage (0-100) added to --ldap-interval (default: 0)')
     coopts.add_argument('--ldap-page-interval',
                         action='store',
                         default=None,
-                        help='Delay between continuation pages of the same search (e.g. 5, 5s, 1m). Default: disabled')
+                        help='[All modes] Delay between continuation pages of the same search (e.g. 5, 5s, 1m). Default: disabled')
     coopts.add_argument('--ldap-page-jitter',
                         action='store',
                         type=float,
                         default=0,
-                        help='Jitter percentage (0-100) added to --ldap-page-interval (default: 0)')
+                        help='[All modes] Jitter percentage (0-100) added to --ldap-page-interval (default: 0)')
     coopts.add_argument('--throttle',
                         action='store',
                         default=None,
-                        help='Delay between host RPC/SMB calls during computer enum (e.g. 500, 500ms, 2s). Default: disabled')
+                        help='[Computer enum only, ignored by DCOnly] Delay between host RPC/SMB calls (e.g. 500, 500ms, 2s). Default: disabled')
     coopts.add_argument('--throttle-jitter',
                         action='store',
                         type=float,
                         default=0,
-                        help='Jitter percentage (0-100) for --throttle, bidirectional (default: 0)')
+                        help='[Computer enum only, ignored by DCOnly] Jitter percentage (0-100) for --throttle, bidirectional (default: 0)')
     coopts.add_argument('--log-file',
                         action='store',
                         metavar='PATH',
