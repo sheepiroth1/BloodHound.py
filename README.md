@@ -50,7 +50,58 @@ bloodhound-ce-python -u user@domain.local -k -d domain.local -c DCOnly \
   --state myrun --log-file run.log
 ```
 
+## Collection Methods
+
+The `-c` / `--collectionmethod` flag controls what gets collected. You can combine methods with commas (e.g. `-c Group,Session`).
+
+### Presets
+
+| Preset | Expands to | Connects to hosts? |
+|--------|-----------|-------------------|
+| `Default` | Group, LocalAdmin, Session, Trusts | Yes |
+| `DCOnly` | Group, Trusts, ObjectProps, ACL, Container | **No** — DC only |
+| `All` | Group, LocalAdmin, Session, Trusts, ObjectProps, ACL, DCOM, RDP, PSRemote, Container | Yes |
+
+### Individual Methods
+
+| Method | What it collects | Queries DC (LDAP)? | Connects to hosts (SMB/RPC)? |
+|--------|-----------------|-------------------|------------------------------|
+| `Group` | Users, groups, computers, memberships | Yes | No |
+| `ObjectProps` | Extended properties (lastLogon, pwdLastSet, etc.) | Yes | No |
+| `ACL` | Security descriptors / access control lists | Yes | No |
+| `Trusts` | Domain and forest trust relationships | Yes | No |
+| `Container` | GPOs, OUs, container hierarchy | Yes | No |
+| `Session` | Active sessions on each machine | Yes (computer list) | **Yes** |
+| `LocalAdmin` | Local Administrators group on each machine | Yes (computer list) | **Yes** |
+| `RDP` | Remote Desktop Users group on each machine | Yes (computer list) | **Yes** |
+| `DCOM` | Distributed COM Users group on each machine | Yes (computer list) | **Yes** |
+| `PSRemote` | Remote Management Users group on each machine | Yes (computer list) | **Yes** |
+| `LoggedOn` | Logged-on users via privileged enumeration | Yes (computer list) | **Yes** |
+| `Experimental` | Services and scheduled tasks with stored creds | Yes (computer list) | **Yes** |
+
+The "Queries DC" column is what `--ldap-*` flags control. The "Connects to hosts" column is what `--throttle` controls.
+
 ## Parameters
+
+### Which flags apply to which modes
+
+This is the key table. Every flag is tagged with when it actually does something.
+
+| Flag | Applies to | Ignored by |
+|------|-----------|------------|
+| `--ldap-interval` | All modes (anything that queries LDAP) | — |
+| `--ldap-jitter` | All modes | — |
+| `--ldap-page-interval` | All modes | — |
+| `--ldap-page-jitter` | All modes | — |
+| `--throttle` | Session, LocalAdmin, RDP, DCOM, PSRemote, LoggedOn, Experimental | DCOnly, Group, Trusts, ACL, ObjectProps, Container |
+| `--throttle-jitter` | Session, LocalAdmin, RDP, DCOM, PSRemote, LoggedOn, Experimental | DCOnly, Group, Trusts, ACL, ObjectProps, Container |
+| `-w` / `--workers` | Session, LocalAdmin, RDP, DCOM, PSRemote, LoggedOn, Experimental | DCOnly, Group, Trusts, ACL, ObjectProps, Container |
+| `--exclude-dcs` | Session, LocalAdmin, RDP, DCOM, PSRemote, LoggedOn, Experimental | DCOnly, Group, Trusts, ACL, ObjectProps, Container |
+| `--computerfile` | Session, LocalAdmin, RDP, DCOM, PSRemote, LoggedOn, Experimental | DCOnly, Group, Trusts, ACL, ObjectProps, Container |
+| `--disable-pooling` | ACL | Everything else |
+| `--search-base` | All LDAP queries (but trust/domain queries always use domain root) | — |
+| `--state` / `--reset-state` | All modes | — |
+| `--log-file` | All modes | — |
 
 ### Authentication
 
@@ -64,36 +115,24 @@ bloodhound-ce-python -u user@domain.local -k -d domain.local -c DCOnly \
 | `-no-pass` | Don't prompt for a password (useful with `-k`) |
 | `--auth-method` | `auto` (default), `kerberos`, or `ntlm`. Auto tries Kerberos first, falls back to NTLM |
 
-### Collection
+### Connection
 
 | Flag | Description |
 |------|-------------|
-| `-c`, `--collectionmethod` | What to collect. Comma-separated. Default: `Group,LocalAdmin,Session,Trusts`. See `--help` for full list. `DCOnly` avoids connecting to member machines |
 | `-d`, `--domain` | Target domain. Auto-detected from DNS if omitted |
 | `-dc` | Override the domain controller hostname (must be FQDN, not IP) |
 | `-gc` | Override the Global Catalog hostname |
 | `-ns` | Custom DNS server IP |
 | `--dns-tcp` | Use TCP for DNS queries instead of UDP |
 | `--dns-timeout` | DNS timeout in seconds (default: 3) |
-| `-w`, `--workers` | Threads for computer enumeration (default: 10). Only matters for non-DCOnly methods |
-| `--exclude-dcs` | Skip domain controllers during computer enumeration |
-| `--computerfile` | File with FQDNs to limit computer enumeration to |
+| `--use-ldaps` | Connect to LDAP over TLS (port 636) by default |
+| `--ldap-channel-binding` | Use LDAP channel binding. Forces LDAPS |
+| `--disable-autogc` | Don't auto-select a Global Catalog server |
 | `--search-base` | Custom LDAP search base DN (e.g. `OU=Sales,DC=corp,DC=local`). Limits enumeration scope to a subtree. Trust and domain-level queries still use the domain root |
 
-### Throttling
+### LDAP Pacing (all modes — any method that queries the DC)
 
-There are two independent throttling systems. Which one you need depends on your collection method:
-
-| Collection Method | Talks to | Throttle flags that apply |
-|-------------------|----------|--------------------------|
-| `DCOnly`, `Group`, `Trusts`, `ACL`, `ObjectProps`, `Container` | Domain controller only (LDAP) | `--ldap-interval`, `--ldap-page-interval` |
-| `Session`, `LocalAdmin`, `RDP`, `DCOM`, `PSRemote`, `LoggedOn` | Individual host machines (SMB/RPC) **and** the DC (LDAP) | Both LDAP flags **and** `--throttle` |
-
-> **Rule of thumb:** If you run `-c DCOnly`, only the `--ldap-*` flags matter. The `--throttle` flag is silently ignored because no host connections are made. If you run `-c All` or any computer-targeting method, both sets of flags apply.
-
-#### LDAP pacing (all modes)
-
-Controls how fast LDAP queries are sent to the domain controller. Applies to every collection method.
+Controls how fast LDAP queries are sent. Every collection method queries the DC, so these always apply.
 
 | Flag | Example | What It Does |
 |------|---------|-------------|
@@ -106,18 +145,28 @@ Controls how fast LDAP queries are sent to the domain controller. Applies to eve
 
 Duration values accept: plain number (seconds), or suffix `s` (seconds), `m` (minutes), `h` (hours).
 
-#### Host RPC pacing (computer enumeration only — ignored by DCOnly)
+### Host RPC Pacing (computer enumeration only)
 
-Controls timing of SMB/RPC connections when enumerating individual machines (session, localadmin, rdp, dcom, psremote, loggedon). These flags have **no effect** on DCOnly or any LDAP-only collection method.
+Controls timing of SMB/RPC connections when enumerating individual machines. These flags have **no effect** when running DCOnly, Group, Trusts, ACL, ObjectProps, or Container — those methods never connect to hosts.
 
 | Flag | Example | What It Does |
 |------|---------|-------------|
 | `--throttle` | `500ms`, `2s`, `1m` | Minimum delay between host RPC calls, serialized across all worker threads. Plain number = milliseconds. Suffixes: `ms`, `s`, `m`, `h` |
 | `--throttle-jitter` | `30` | Percentage (0-100) of **bidirectional** jitter. 30 means the actual delay varies ±30% around the base value |
 
+### Computer Enumeration
+
+These flags only matter when a host-connecting method is in use (Session, LocalAdmin, RDP, DCOM, PSRemote, LoggedOn, Experimental). They are ignored by DCOnly and other LDAP-only methods.
+
+| Flag | Description |
+|------|-------------|
+| `-w`, `--workers` | Number of threads connecting to hosts in parallel (default: 10) |
+| `--exclude-dcs` | Skip domain controllers during computer enumeration |
+| `--computerfile` | File containing FQDNs — only enumerate these machines |
+
 ### Resume and State
 
-Allow interrupted runs to continue without re-querying completed work.
+Allow interrupted runs to continue without re-querying completed work. Applies to all modes.
 
 | Flag | What It Does |
 |------|-------------|
@@ -128,22 +177,14 @@ The state file tracks which OUs and collection phases are complete. On resume, c
 
 ### Output
 
-| Flag | What It Does |
+| Flag | Description |
 |------|-------------|
 | `-op`, `--outputprefix` | Prepend this string to all output filenames |
 | `--zip` | Compress output JSON files into a timestamped zip and delete the originals |
 | `--log-file PATH` | Write debug-level log to a file. Console output level is unchanged (INFO unless `-v` is set). Useful for post-mortem debugging of long throttled runs |
 | `-v` | Verbose console output (DEBUG level) |
-
-### Other
-
-| Flag | What It Does |
-|------|-------------|
-| `--use-ldaps` | Connect to LDAP over TLS (port 636) by default |
-| `--ldap-channel-binding` | Use LDAP channel binding. Forces LDAPS |
-| `--disable-pooling` | Disable subprocesses for ACL parsing (debug only) |
-| `--disable-autogc` | Don't auto-select a Global Catalog server |
 | `--cachefile` | Load a resolver cache file (experimental) |
+| `--disable-pooling` | Disable subprocesses for ACL parsing. Only affects ACL collection. Debug use only |
 
 ## Connection Resilience
 
